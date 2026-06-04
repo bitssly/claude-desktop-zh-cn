@@ -5,7 +5,7 @@
     [string]$PatchMode = "full",
 
     [Parameter(Position = 0)]
-    [ValidateSet("install", "uninstall")]
+    [ValidateSet("install", "uninstall", "disable-updates", "enable-updates")]
     [string]$Action = "install",
 
     [Parameter(Position = 1)]
@@ -118,6 +118,8 @@ function Read-InteractiveSelection {
     Write-Host "[2] 安装中文补丁(官方账号登录方式：Cowork 沙箱/工作区不可用)"
     Write-Host "[3] 安装中文补丁(第三方 API 登录方式：同时去除模型限制；Cowork 沙箱/工作区不可用)"
     Write-Host "[4] 恢复原样 / 卸载补丁"
+    Write-Host "[5] 禁止自动更新"
+    Write-Host "[6] 允许自动更新"
     Write-Host "[Q] 退出"
     Write-Host ""
 
@@ -130,8 +132,10 @@ function Read-InteractiveSelection {
             '^[2]$' { $patchModeForInstall = "official"; $actionSelected = $true }
             '^[3]$' { $patchModeForInstall = "full"; $actionSelected = $true }
             '^[4]$' { return @{ Action = "uninstall"; Language = "zh-CN"; PatchMode = "safe" } }
+            '^[5]$' { return @{ Action = "disable-updates"; Language = "zh-CN"; PatchMode = "safe" } }
+            '^[6]$' { return @{ Action = "enable-updates"; Language = "zh-CN"; PatchMode = "safe" } }
             '^[Qq]$' { exit 0 }
-            default { Write-Host "请输入 1、2、3、4 或 Q。" -ForegroundColor Yellow }
+            default { Write-Host "请输入 1、2、3、4、5、6 或 Q。" -ForegroundColor Yellow }
         }
     }
 
@@ -1276,12 +1280,32 @@ function Test-PlainUiTextReplacement {
     return $true
 }
 
+function Test-StructuralJsReplacement {
+    param([string]$Source)
+
+    $structuralStrings = @(
+        "hour", "hours",
+        "minute", "minutes",
+        "second", "seconds",
+        "day", "days",
+        "week", "weeks",
+        "month", "months",
+        "year", "years"
+    )
+    $structuralLiterals = @('"Search"')
+    return ($structuralStrings -contains $Source) -or ($structuralLiterals -contains $Source)
+}
+
 function Replace-FrontendHardcodedText {
     param(
         [string]$Text,
         [string]$Source,
         [string]$Target
     )
+
+    if (Test-StructuralJsReplacement $Source) {
+        return @{ Text = $Text; Count = 0 }
+    }
 
     if (-not (Test-PlainUiTextReplacement $Source)) {
         $occurrences = 0
@@ -1300,7 +1324,7 @@ function Replace-FrontendHardcodedText {
         return @{ Text = $Text; Count = 0 }
     }
 
-    $pattern = '(?<![A-Za-z0-9_$])' + [System.Text.RegularExpressions.Regex]::Escape($Source) + '(?![A-Za-z0-9_$])'
+    $pattern = '(?<quote>["''`])' + [System.Text.RegularExpressions.Regex]::Escape($Source) + '\k<quote>'
     $script:__frontendReplacementCount = 0
     $patched = [System.Text.RegularExpressions.Regex]::Replace(
         $Text,
@@ -1308,7 +1332,8 @@ function Replace-FrontendHardcodedText {
         {
             param($match)
             $script:__frontendReplacementCount += 1
-            return $Target
+            $quote = $match.Groups["quote"].Value
+            return "$quote$Target$quote"
         }
     )
     $count = $script:__frontendReplacementCount
@@ -1386,10 +1411,47 @@ function Get-OnlineDomTranslationScript {
     Write-Host "  serializing online DOM translation script" -ForegroundColor DarkGray
     $mappingJson = $Mapping | ConvertTo-Json -Compress -Depth 100
     $languageJson = $Language | ConvertTo-Json -Compress
+    if ($Language -eq "zh-CN") {
+        $selectedText = "已选择 `$1 项"
+        $deleteSelectedText = "删除 `$1 个所选项目"
+    } else {
+        $selectedText = "已選擇 `$1 項"
+        $deleteSelectedText = "刪除 `$1 個所選項目"
+    }
+    $selectedTextJson = $selectedText | ConvertTo-Json -Compress
+    $deleteSelectedTextJson = $deleteSelectedText | ConvertTo-Json -Compress
     $template = @'
-(()=>{try{const L=__LANGUAGE__,M=__MAPPING__;localStorage.setItem("spa:locale",L);document.documentElement&&document.documentElement.setAttribute("lang",L);const N=s=>(s||"").replace(/\s+/g," ").trim();const G=[[/^Morning, (.+)$/,"早上好，$1"],[/^Good morning, (.+)$/,"早上好，$1"],[/^Afternoon, (.+)$/,"下午好，$1"],[/^Good afternoon, (.+)$/,"下午好，$1"],[/^Evening, (.+)$/,"晚上好，$1"],[/^Good evening, (.+)$/,"晚上好，$1"],[/^It's late-night (.+)$/,"夜深了，$1"],[/^Good night, (.+)$/,"晚安，$1"],[/^Delete (\d+) chat$/,"删除 $1 个聊天"],[/^Delete (\d+) chats$/,"删除 $1 个聊天"],[/^Move (\d+) chat to a project$/,"将 $1 个聊天移至项目"],[/^Move (\d+) chats to a project$/,"将 $1 个聊天移至项目"],[/^Connection needs (\d+) field$/,"连接还需要填写 $1 个字段"],[/^Connection needs (\d+) fields$/,"连接还需要填写 $1 个字段"],[/^needs (\d+) field$/,"还需要填写 $1 个字段"],[/^needs (\d+) fields$/,"还需要填写 $1 个字段"],[/^Are you sure you want to delete (\d+) chat\? This cannot be undone\.$/,"你确定要删除 $1 个聊天吗？此操作无法撤消。"],[/^Are you sure you want to delete (\d+) chats\? This cannot be undone\.$/,"你确定要删除 $1 个聊天吗？此操作无法撤消。"],[/^Are you sure you want to permanently delete this chat\? This cannot be undone\.$/,"你确定要永久删除此聊天吗？此操作无法撤消。"],[/^Are you sure you want to permanently delete these chats\? This cannot be undone\.$/,"你确定要永久删除这些聊天吗？此操作无法撤消。"]];const R=s=>{const n=N(s);if(M[n])return M[n];for(const [r,t] of G){const m=n.match(r);if(m)return t.replace("$1",m[1])}};const X=new Set(["SCRIPT","STYLE","NOSCRIPT"]);function T(){try{const b=document.body||document.documentElement;if(!b)return;const w=document.createTreeWalker(b,NodeFilter.SHOW_TEXT,{acceptNode(n){const p=n.parentElement;if(!p||X.has(p.tagName)||!R(n.nodeValue))return NodeFilter.FILTER_REJECT;return NodeFilter.FILTER_ACCEPT}});let n;while(n=w.nextNode()){const v=R(n.nodeValue);if(v)n.nodeValue=v}document.querySelectorAll("[aria-label],[title],[placeholder],input,textarea").forEach(e=>{["aria-label","title","placeholder","value"].forEach(a=>{try{if(a==="value"&&!(e.matches("input[type=button],input[type=submit]")))return;const v=e.getAttribute?e.getAttribute(a):e[a];const t=R(v);if(t){if(e.setAttribute)e.setAttribute(a,t);else e[a]=t}}catch{}})});document.querySelectorAll("a").forEach(e=>{try{const r=e.getBoundingClientRect(),txt=N(e.textContent);if(txt==="Claude"&&r.left<100&&r.top<100)e.style.visibility="hidden"}catch{}})}catch{}}T();new MutationObserver(()=>{clearTimeout(window.__claudeZhDomTimer);window.__claudeZhDomTimer=setTimeout(T,30)}).observe(document.documentElement,{subtree:true,childList:true,characterData:true,attributes:true});}catch(e){}})()
+(()=>{try{
+const L=__LANGUAGE__,M=__MAPPING__,ST=__SELECTED_TEXT__,DST=__DELETE_SELECTED_TEXT__;
+localStorage.setItem("spa:locale",L);
+document.documentElement&&document.documentElement.setAttribute("lang",L);
+const N=s=>(s||"").replace(/\s+/g," ").trim();
+const G=[
+[/^Morning, (.+)$/,"早上好，$1"],[/^Good morning, (.+)$/,"早上好，$1"],
+[/^Afternoon, (.+)$/,"下午好，$1"],[/^Good afternoon, (.+)$/,"下午好，$1"],
+[/^Evening, (.+)$/,"晚上好，$1"],[/^Good evening, (.+)$/,"晚上好，$1"],
+[/^It's late-night (.+)$/,"夜深了，$1"],[/^Good night, (.+)$/,"晚安，$1"],
+[/^Delete (\d+) chat$/,"删除 $1 个聊天"],[/^Delete (\d+) chats$/,"删除 $1 个聊天"],
+[/^Move (\d+) chat to a project$/,"将 $1 个聊天移至项目"],[/^Move (\d+) chats to a project$/,"将 $1 个聊天移至项目"],
+[/^Connection needs (\d+) field$/,"连接还需要填写 $1 个字段"],[/^Connection needs (\d+) fields$/,"连接还需要填写 $1 个字段"],
+[/^needs (\d+) field$/,"还需要填写 $1 个字段"],[/^needs (\d+) fields$/,"还需要填写 $1 个字段"],
+[/^Are you sure you want to delete (\d+) chat\? This cannot be undone\.$/,"你确定要删除 $1 个聊天吗？此操作无法撤消。"],
+[/^Are you sure you want to delete (\d+) chats\? This cannot be undone\.$/,"你确定要删除 $1 个聊天吗？此操作无法撤消。"],
+[/^Are you sure you want to permanently delete this chat\? This cannot be undone\.$/,"你确定要永久删除此聊天吗？此操作无法撤消。"],
+[/^Are you sure you want to permanently delete these chats\? This cannot be undone\.$/,"你确定要永久删除这些聊天吗？此操作无法撤消。"],
+[/^(\d+) selected$/,ST],
+[/^Delete (\d+) selected item$/,DST],
+[/^Delete (\d+) selected items$/,DST],
+[/^Mon$/,"周一"],[/^Tue$/,"周二"],[/^Wed$/,"周三"],[/^Thu$/,"周四"],[/^Fri$/,"周五"],[/^Sat$/,"周六"],[/^Sun$/,"周日"]
+];
+const R=s=>{const n=N(s);if(M[n])return M[n];for(const [r,t] of G){const m=n.match(r);if(m)return t.replace("$1",m[1])}};
+const X=new Set(["SCRIPT","STYLE","NOSCRIPT"]);
+function T(){try{const b=document.body||document.documentElement;if(!b)return;const w=document.createTreeWalker(b,NodeFilter.SHOW_TEXT,{acceptNode(n){const p=n.parentElement;if(!p||X.has(p.tagName)||!R(n.nodeValue))return NodeFilter.FILTER_REJECT;return NodeFilter.FILTER_ACCEPT}});let n;while(n=w.nextNode()){const v=R(n.nodeValue);if(v)n.nodeValue=v}document.querySelectorAll("[aria-label],[title],[placeholder],input,textarea").forEach(e=>{["aria-label","title","placeholder","value"].forEach(a=>{try{if(a==="value"&&!(e.matches("input[type=button],input[type=submit]")))return;let v=e.getAttribute?e.getAttribute(a):void 0;if(v==null&&a in e)v=e[a];const t=R(v);if(t){if(e.setAttribute)e.setAttribute(a,t);try{if(a in e)e[a]=t}catch{}}}catch{}})});document.querySelectorAll("a").forEach(e=>{try{const r=e.getBoundingClientRect(),txt=N(e.textContent);if(txt==="Claude"&&r.left<100&&r.top<100)e.style.visibility="hidden"}catch{}})}catch{}}
+T();
+new MutationObserver(()=>{clearTimeout(window.__claudeZhDomTimer);window.__claudeZhDomTimer=setTimeout(T,30)}).observe(document.documentElement,{subtree:true,childList:true,characterData:true,attributes:true});
+}catch(e){}})()
 '@
-    return $template.Replace("__LANGUAGE__", $languageJson).Replace("__MAPPING__", $mappingJson)
+    return $template.Replace("__LANGUAGE__", $languageJson).Replace("__MAPPING__", $mappingJson).Replace("__SELECTED_TEXT__", $selectedTextJson).Replace("__DELETE_SELECTED_TEXT__", $deleteSelectedTextJson)
 }
 
 function Remove-ExistingOnlineDomTranslationPatch {
@@ -2099,35 +2161,151 @@ function Set-ClaudeLocale {
     }
 }
 
-function Test-ThirdPartyApiConfigExists {
-    if (-not $env:LOCALAPPDATA) {
-        return $false
+function Get-ThirdPartyConfigLibraryPaths {
+    $paths = @()
+    if ($env:APPDATA) {
+        $paths += Join-Path $env:APPDATA "Claude-3p\configLibrary"
     }
 
-    $configLibrary = Join-Path $env:LOCALAPPDATA "Claude-3p\configLibrary"
-    if (-not (Test-Path $configLibrary -PathType Container)) {
-        return $false
+    if ($env:LOCALAPPDATA) {
+        $packageRoot = Join-Path $env:LOCALAPPDATA "Packages"
+        $packageDirs = @(Get-ChildItem (Join-Path $packageRoot "Claude_*") -Directory -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending)
+        foreach ($packageDir in $packageDirs) {
+            $paths += Join-Path $packageDir.FullName "LocalCache\Roaming\Claude-3p\configLibrary"
+        }
     }
 
-    $entries = @(Get-ChildItem $configLibrary -Force -ErrorAction SilentlyContinue | Select-Object -First 1)
-    return $entries.Count -gt 0
+    return @($paths | Select-Object -Unique)
 }
 
-function Confirm-InstallWithoutThirdPartyApiConfig {
-    if (Test-ThirdPartyApiConfigExists) {
-        return $true
+function Get-JsonObjectOrBackup {
+    param([string]$Path)
+
+    if (-not (Test-Path $Path -PathType Leaf)) {
+        return [pscustomobject]@{}
     }
 
-    while ($true) {
-        $selection = (Read-Host "未配置第三方API，程序运行后无效，请参照github上readme修改，是否继续配置？ [y/n]").Trim()
-        switch -Regex ($selection) {
-            '^[Yy]$' { return $true }
-            '^[Nn]$' {
-                Write-Host "已取消配置，未修改 Claude Desktop。" -ForegroundColor Yellow
-                return $false
-            }
-            default { Write-Host "请输入 y 或 n。" -ForegroundColor Yellow }
+    try {
+        $loaded = Get-Content $Path -Raw | ConvertFrom-Json
+        if ($loaded -is [pscustomobject]) {
+            return $loaded
         }
+        throw "JSON root is not an object."
+    }
+    catch {
+        $backup = "$Path.bak-invalid"
+        Copy-Item $Path $backup -Force
+        return [pscustomobject]@{}
+    }
+}
+
+function Add-OrSetJsonProperty {
+    param(
+        [pscustomobject]$Object,
+        [string]$Name,
+        [object]$Value
+    )
+
+    $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
+}
+
+function Ensure-ConfigLibraryEntry {
+    param(
+        [pscustomobject]$Meta,
+        [string]$ConfigId
+    )
+
+    Add-OrSetJsonProperty $Meta "appliedId" $ConfigId
+
+    $entries = @()
+    if ($Meta.PSObject.Properties.Name -contains "entries" -and $Meta.entries) {
+        $entries = @($Meta.entries)
+    }
+
+    foreach ($entry in $entries) {
+        if ($entry -is [pscustomobject] -and [string]$entry.id -eq $ConfigId) {
+            Add-OrSetJsonProperty $Meta "entries" $entries
+            return
+        }
+    }
+
+    $entries += [pscustomobject]@{ id = $ConfigId; name = "Default" }
+    Add-OrSetJsonProperty $Meta "entries" $entries
+}
+
+function Set-ThirdPartyAutoUpdates {
+    param([bool]$Enabled)
+
+    $libraryPaths = @(Get-ThirdPartyConfigLibraryPaths)
+    $existingMetaPaths = @()
+    foreach ($configLibrary in $libraryPaths) {
+        $metaPath = Join-Path $configLibrary "_meta.json"
+        if (Test-Path $metaPath -PathType Leaf) {
+            $existingMetaPaths += $configLibrary
+        }
+    }
+
+    if ($existingMetaPaths.Count -gt 0) {
+        $libraryPaths = $existingMetaPaths
+    } else {
+        $existingLibraryPaths = @()
+        foreach ($configLibrary in $libraryPaths) {
+            if (Test-Path $configLibrary -PathType Container) {
+                $existingLibraryPaths += $configLibrary
+            }
+        }
+
+        if ($existingLibraryPaths.Count -gt 0) {
+            $libraryPaths = $existingLibraryPaths
+        } elseif ($env:APPDATA) {
+            $libraryPaths = @(Join-Path $env:APPDATA "Claude-3p\configLibrary")
+        } elseif ($env:LOCALAPPDATA) {
+            $libraryPaths = @(Join-Path $env:LOCALAPPDATA "Claude-3p\configLibrary")
+        } else {
+            Write-Host "  [警告] APPDATA 和 LOCALAPPDATA 均未设置，无法写入 Claude-3p 自动更新配置。" -ForegroundColor DarkYellow
+            return
+        }
+    }
+
+    $updatedCount = 0
+    foreach ($configLibrary in $libraryPaths) {
+        $metaPath = Join-Path $configLibrary "_meta.json"
+        $creatingLibrary = -not (Test-Path $metaPath -PathType Leaf)
+
+        $meta = Get-JsonObjectOrBackup $metaPath
+        $configId = ""
+        if ($meta.PSObject.Properties.Name -contains "appliedId") {
+            $configId = ([string]$meta.appliedId).Trim()
+        }
+
+        if (-not $configId) {
+            $existingConfigs = @(Get-ChildItem $configLibrary -Filter "*.json" -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -ne "_meta.json" } |
+                Sort-Object Name)
+            if ($existingConfigs.Count -gt 0) {
+                $configId = [System.IO.Path]::GetFileNameWithoutExtension($existingConfigs[0].Name)
+            } else {
+                $configId = [guid]::NewGuid().ToString()
+            }
+        }
+
+        $configPath = Join-Path $configLibrary "$configId.json"
+        $config = Get-JsonObjectOrBackup $configPath
+        Add-OrSetJsonProperty $config "disableAutoUpdates" (-not $Enabled)
+        Ensure-ConfigLibraryEntry $meta $configId
+
+        New-Item -ItemType Directory -Path $configLibrary -Force | Out-Null
+        $config | ConvertTo-Json -Depth 20 | Set-Content $configPath -Encoding UTF8
+        $meta | ConvertTo-Json -Depth 20 | Set-Content $metaPath -Encoding UTF8
+
+        $updatedCount++
+    }
+
+    if ($Enabled) {
+        Write-Host "允许更新成功" -ForegroundColor Green
+    } else {
+        Write-Host "禁止更新成功" -ForegroundColor Green
     }
 }
 
@@ -2183,11 +2361,11 @@ function Install-WindowsLanguagePack {
     try {
         Write-Step "[1/9] 检查安装模式"
         if ($PatchMode -eq "safe") {
-            Write-Host "  Cowork 兼容模式：跳过第三方 API 配置检查。" -ForegroundColor Green
+            Write-Host "  Cowork 兼容模式：无需第三方 API 配置检查。" -ForegroundColor Green
         } elseif ($PatchMode -eq "official") {
-            Write-Host "  官方账号登录模式：跳过第三方 API 配置检查。" -ForegroundColor Green
-        } elseif (-not (Confirm-InstallWithoutThirdPartyApiConfig)) {
-            return
+            Write-Host "  官方账号登录模式：无需第三方 API 配置检查。" -ForegroundColor Green
+        } else {
+            Write-Host "  第三方 API 登录模式：无需第三方 API 配置检查。" -ForegroundColor Green
         }
 
         Write-Step "[2/9] 检查语言资源"
@@ -2293,6 +2471,8 @@ try {
     switch ($Action) {
         "install" { Install-WindowsLanguagePack }
         "uninstall" { Uninstall-WindowsLanguagePack }
+        "disable-updates" { Set-ThirdPartyAutoUpdates $false }
+        "enable-updates" { Set-ThirdPartyAutoUpdates $true }
     }
 
     Stop-InstallLog

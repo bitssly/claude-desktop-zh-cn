@@ -29,6 +29,7 @@ import struct
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,25 @@ ONLINE_LOCALE_PRELOAD_TARGETS = [
 ONLINE_LOCALE_MARKER = "__claudeZhOnlineLocale"
 ONLINE_LOCALE_MAIN_MARKER = "__claudeZhOnlineLocaleMain"
 ONLINE_TRANSLATION_MAX_SOURCE_LEN = 240
+STRUCTURAL_JS_STRING_REPLACEMENTS = {
+    "hour",
+    "hours",
+    "minute",
+    "minutes",
+    "second",
+    "seconds",
+    "day",
+    "days",
+    "week",
+    "weeks",
+    "month",
+    "months",
+    "year",
+    "years",
+}
+STRUCTURAL_JS_LITERAL_REPLACEMENTS = {
+    '"Search"',
+}
 
 
 def log(message: str) -> None:
@@ -217,6 +237,9 @@ def is_plain_ui_text_replacement(source: str) -> bool:
 
 
 def replace_frontend_hardcoded_text(text: str, source: str, target: str) -> tuple[str, int]:
+    if source in STRUCTURAL_JS_STRING_REPLACEMENTS or source in STRUCTURAL_JS_LITERAL_REPLACEMENTS:
+        return text, 0
+
     if not is_plain_ui_text_replacement(source):
         count = text.count(source)
         if count:
@@ -506,6 +529,19 @@ def build_online_translation_map(app: Path, lang_code: str) -> dict[str, str]:
 
 def build_online_dom_translation_script(lang_code: str, mapping: dict[str, str]) -> str:
     mapping_json = json.dumps(mapping, ensure_ascii=False, separators=(",", ":"))
+    if lang_code == "zh-CN":
+        selected_text = "已选择 $1 项"
+        delete_selected_text = "删除 $1 个所选项目"
+    else:
+        selected_text = "已選擇 $1 項"
+        delete_selected_text = "刪除 $1 個所選項目"
+    dynamic_rules = "".join((
+        f'[/^(\\d+) selected$/,"{selected_text}"],'
+        f'[/^Delete (\\d+) selected item$/,"{delete_selected_text}"],'
+        f'[/^Delete (\\d+) selected items$/,"{delete_selected_text}"],'
+        '[/^Mon$/,"周一"],[/^Tue$/,"周二"],[/^Wed$/,"周三"],[/^Thu$/,"周四"],'
+        '[/^Fri$/,"周五"],[/^Sat$/,"周六"],[/^Sun$/,"周日"]'
+    ))
     return (
         "(()=>{try{"
         f'const L="{lang_code}",M={mapping_json};'
@@ -523,7 +559,8 @@ def build_online_dom_translation_script(lang_code: str, mapping: dict[str, str])
         '[/^Are you sure you want to delete (\\d+) chat\\? This cannot be undone\\.$/,"你确定要删除 $1 个聊天吗？此操作无法撤消。"],'
         '[/^Are you sure you want to delete (\\d+) chats\\? This cannot be undone\\.$/,"你确定要删除 $1 个聊天吗？此操作无法撤消。"],'
         '[/^Are you sure you want to permanently delete this chat\\? This cannot be undone\\.$/,"你确定要永久删除此聊天吗？此操作无法撤消。"],'
-        '[/^Are you sure you want to permanently delete these chats\\? This cannot be undone\\.$/,"你确定要永久删除这些聊天吗？此操作无法撤消。"]];'
+        '[/^Are you sure you want to permanently delete these chats\\? This cannot be undone\\.$/,"你确定要永久删除这些聊天吗？此操作无法撤消。"],'
+        f'{dynamic_rules}];'
         'const R=s=>{const n=N(s);if(M[n])return M[n];for(const [r,t] of G){const m=n.match(r);'
         'if(m)return t.replace("$1",m[1])}};'
         'const X=new Set(["SCRIPT","STYLE","NOSCRIPT"]);'
@@ -531,14 +568,14 @@ def build_online_dom_translation_script(lang_code: str, mapping: dict[str, str])
         "try{"
         "const b=document.body||document.documentElement;if(!b)return;"
         "const w=document.createTreeWalker(b,NodeFilter.SHOW_TEXT,{acceptNode(n){"
-        "const p=n.parentElement;if(!p||X.has(p.tagName)||!R(n.nodeValue))return NodeFilter.FILTER_REJECT;"
+        "const p=n.parentElement;if(!p||X.has(p.tagName)||p.closest('[contenteditable]')||!R(n.nodeValue))return NodeFilter.FILTER_REJECT;"
         "return NodeFilter.FILTER_ACCEPT}});"
         "let n;while(n=w.nextNode()){const v=R(n.nodeValue);if(v)n.nodeValue=v}"
         'document.querySelectorAll("[aria-label],[title],[placeholder],input,textarea").forEach(e=>{'
         '["aria-label","title","placeholder","value"].forEach(a=>{'
         'try{if(a==="value"&&!(e.matches("input[type=button],input[type=submit]")))return;'
-        "const v=e.getAttribute?e.getAttribute(a):e[a];const t=R(v);"
-        "if(t){if(e.setAttribute)e.setAttribute(a,t);else e[a]=t}}catch{}})});"
+        "let v=e.getAttribute?e.getAttribute(a):void 0;if(v==null&&a in e)v=e[a];const t=R(v);"
+        "if(t){if(e.setAttribute)e.setAttribute(a,t);try{if(a in e)e[a]=t}catch{}}}catch{}})});"
         'document.querySelectorAll("a").forEach(e=>{try{'
         'const r=e.getBoundingClientRect(),txt=N(e.textContent);'
         'if(txt==="Claude"&&r.left<100&&r.top<100)e.style.visibility="hidden"}catch{}});'
@@ -1267,26 +1304,74 @@ def set_user_locale(user_home: Path, lang_code: str) -> None:
     print(f"Set Claude config locale: {config}")
 
 
-def has_third_party_api_config(user_home: Path) -> bool:
+def chown_to_sudo_user(path: Path) -> None:
+    sudo_uid = os.environ.get("SUDO_UID")
+    sudo_gid = os.environ.get("SUDO_GID")
+    if sudo_uid and sudo_gid and path.exists():
+        os.chown(path, int(sudo_uid), int(sudo_gid))
+
+
+def load_json_object_or_backup(path: Path, dry_run: bool = False) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        data = load_json(path)
+        if isinstance(data, dict):
+            return data
+        raise ValueError("JSON root is not an object")
+    except Exception:
+        backup = path.with_suffix(path.suffix + ".bak-invalid")
+        if dry_run:
+            print(f"[dry-run] Existing config is not valid JSON; would back up to {backup}")
+        else:
+            shutil.copy2(path, backup)
+        return {}
+
+
+def ensure_config_library_entry(meta: dict[str, Any], config_id: str) -> None:
+    meta["appliedId"] = config_id
+    entries = meta.get("entries")
+    if not isinstance(entries, list):
+        entries = []
+        meta["entries"] = entries
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("id") == config_id:
+            return
+    entries.append({"id": config_id, "name": "Default"})
+
+
+def set_third_party_auto_updates(user_home: Path, enabled: bool, dry_run: bool = False) -> bool:
     config_library = user_home / "Library/Application Support/Claude-3p/configLibrary"
-    if not config_library.is_dir():
-        return False
-    return any(config_library.iterdir())
+    meta_path = config_library / "_meta.json"
+    creating_library = not meta_path.exists()
+    meta = load_json_object_or_backup(meta_path, dry_run=dry_run)
+    applied_id = meta.get("appliedId")
+    config_id = str(applied_id) if isinstance(applied_id, str) and applied_id.strip() else ""
 
+    if not config_id:
+        existing_configs = sorted(
+            path for path in config_library.glob("*.json") if path.name != "_meta.json"
+        )
+        config_id = existing_configs[0].stem if existing_configs else str(uuid.uuid4())
 
-def confirm_install_without_third_party_api_config(user_home: Path) -> bool:
-    if has_third_party_api_config(user_home):
+    config_path = config_library / f"{config_id}.json"
+    config = load_json_object_or_backup(config_path, dry_run=dry_run)
+    config["disableAutoUpdates"] = not enabled
+    ensure_config_library_entry(meta, config_id)
+
+    state = "允许" if enabled else "禁止"
+    if dry_run:
+        action = "create and update" if creating_library else "update"
+        print(f"[dry-run] Would {action} Claude-3p config and {state}自动更新: {config_path}")
         return True
 
-    prompt = "未配置第三方API，程序运行后无效，请参照github上readme修改，是否继续配置？ [y/n]: "
-    while True:
-        choice = input(prompt).strip().lower()
-        if choice == "y":
-            return True
-        if choice == "n":
-            print("已取消配置，未修改 Claude Desktop。")
-            return False
-        print("请输入 y 或 n。")
+    save_json(config_path, config)
+    save_json(meta_path, meta)
+    chown_to_sudo_user(config_path)
+    chown_to_sudo_user(meta_path)
+
+    print("允许更新成功" if enabled else "禁止更新成功")
+    return True
 
 
 def backup_and_replace(original: Path, patched: Path, dry_run: bool) -> Path:
@@ -1393,7 +1478,20 @@ def main() -> int:
     parser.add_argument("--launch", action="store_true", help="Launch Claude after installation")
     parser.add_argument("--restore", action="store_true", help="Restore the oldest macOS app backup and delete other backups")
     parser.add_argument("--skip-asar-patch", action="store_true", help="Skip app.asar and binary integrity patches (safe mode)")
+    parser.add_argument(
+        "--set-auto-updates",
+        choices=["enabled", "disabled"],
+        help="Only update Claude-3p auto-update setting, then exit",
+    )
     args = parser.parse_args()
+
+    if args.set_auto_updates:
+        set_third_party_auto_updates(
+            args.user_home,
+            enabled=args.set_auto_updates == "enabled",
+            dry_run=args.dry_run,
+        )
+        return 0
 
     try:
         in_applications = args.app.resolve().as_posix().startswith("/Applications/")
@@ -1421,9 +1519,6 @@ def main() -> int:
     lang_code = args.lang
     config = get_language_config(lang_code)
     label = config["label"]
-
-    if not confirm_install_without_third_party_api_config(args.user_home):
-        return 0
 
     require_file(config["frontend_translation"])
     require_file(config["frontend_hardcoded"])

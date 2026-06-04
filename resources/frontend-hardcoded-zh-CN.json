@@ -296,10 +296,6 @@
     "\"最近使用\""
   ],
   [
-    "\"Search\"",
-    "\"搜索\""
-  ],
-  [
     "Search settings",
     "搜索设置"
   ],
@@ -580,10 +576,6 @@
     "已下载更新在强制安装前等待的小时数。留空则默认为 72 小时。"
   ],
   [
-    "hours",
-    "小时"
-  ],
-  [
     "<b>{category}</b> needs {count, plural, one {{label}} other {# fields}}",
     "<b>{category}</b> 需要 {count, plural, one {{label}} other {# 个字段}}"
   ],
@@ -714,6 +706,34 @@
   [
     "LJt=\"Untitled\"",
     "LJt=\"未命名\""
+  ],
+  [
+    "Active",
+    "活跃"
+  ],
+  [
+    "Archived",
+    "已归档"
+  ],
+  [
+    "All",
+    "全部"
+  ],
+  [
+    "Untitled",
+    "未命名"
+  ],
+  [
+    "Search chats...",
+    "搜索聊天..."
+  ],
+  [
+    "Search chats…",
+    "搜索聊天..."
+  ],
+  [
+    "Delete selected",
+    "删除所选"
   ],
   [
     "Record Memory Trace (auto-stop)",
