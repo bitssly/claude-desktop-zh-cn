@@ -9,6 +9,7 @@ if [ ! -x "$PYTHON" ]; then
   PYTHON="$(command -v python3)"
 fi
 
+
 check_release_update() {
   if [ "${CLAUDE_ZH_SKIP_UPDATE_CHECK:-0}" = "1" ]; then
     return
@@ -57,21 +58,32 @@ echo "目录: $DIR"
 echo
 
 ACTION="${CLAUDE_ACTION:-}"
-SKIP_ASAR_PATCH="${CLAUDE_SKIP_ASAR_PATCH:-0}"
 if [ -z "$ACTION" ]; then
   echo "请选择操作："
-  echo "  [1] 安装中文补丁(官方订阅与第三方api均可使用：Cowork 沙箱/工作区可能不可用)"
-  echo "  [2] 安装中文补丁(第三方api可用：安全模式，第三方模型需借助ccswitch映射(建议第三方api选此项))"
-  echo "  [3] 恢复原样 / 卸载补丁"
-  echo "  [4] 禁止自动更新"
-  echo "  [5] 允许自动更新"
+  echo "  [1] 安装中文补丁（第三方 API 模式；不改写 app.asar，Claude 官方账号界面已自带中文）"
+  echo "  [2] 恢复原样 / 卸载补丁"
+  echo "  [3] 自动更新设置（y=禁止自动更新，n=允许自动更新）"
+  echo "  [4] 同步CC Switch skills （y=同步，n=删除之前的同步）"
   echo
-  read -rp "请输入选项 [1/2/3/4/5，默认 1]: " action_choice
+  read -rp "请输入选项 [1/2/3/4，默认 1]: " action_choice
   case "${action_choice:-1}" in
-    2) ACTION="install"; SKIP_ASAR_PATCH="1" ;;
-    3) ACTION="restore" ;;
-    4) ACTION="disable-updates" ;;
-    5) ACTION="enable-updates" ;;
+    2) ACTION="restore" ;;
+    3)
+      read -rp "是否禁止自动更新？[y=禁止 / n=允许]: " update_choice
+      case "$update_choice" in
+        y|Y) ACTION="disable-updates" ;;
+        n|N) ACTION="enable-updates" ;;
+        *) echo "无效输入，请输入 y 或 n。"; exit 1 ;;
+      esac
+      ;;
+    4)
+      read -rp "是否同步 CC Switch skills？[y=同步 / n=删除之前的同步]: " skills_choice
+      case "$skills_choice" in
+        y|Y) ACTION="sync-skills" ;;
+        n|N) ACTION="unsync-skills" ;;
+        *) echo "无效输入，请输入 y 或 n。"; exit 1 ;;
+      esac
+      ;;
     *) ACTION="install" ;;
   esac
   echo
@@ -81,8 +93,25 @@ if [ "$ACTION" = "uninstall" ]; then
   ACTION="restore"
 fi
 
+DRY_RUN=0
+for arg in "$@"; do
+  if [ "$arg" = "--dry-run" ]; then
+    DRY_RUN=1
+  fi
+done
+
+if [ "$ACTION" = "install" ]; then
+  echo "安装前清理旧中文补丁..."
+  if [ "$(id -u)" -ne 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+    sudo "$PYTHON" "$PATCHER" --user-home "$HOME" --restore-if-backup-exists "$@"
+  else
+    "$PYTHON" "$PATCHER" --user-home "$HOME" --restore-if-backup-exists "$@"
+  fi
+  echo
+fi
+
 # Language selection
-if [ "$ACTION" = "restore" ] || [ "$ACTION" = "disable-updates" ] || [ "$ACTION" = "enable-updates" ]; then
+if [ "$ACTION" = "restore" ] || [ "$ACTION" = "disable-updates" ] || [ "$ACTION" = "enable-updates" ] || [ "$ACTION" = "sync-skills" ] || [ "$ACTION" = "unsync-skills" ]; then
   LANG_CODE=""
 elif [ -z "${CLAUDE_LANG:-}" ]; then
   echo "请选择要安装的语言："
@@ -101,37 +130,55 @@ else
   LANG_CODE="$CLAUDE_LANG"
 fi
 
-SKIP_ASAR_ARG=""
-case "$SKIP_ASAR_PATCH" in
-  1|true|TRUE|yes|YES|y|Y) SKIP_ASAR_ARG="--skip-asar-patch" ;;
-esac
-
 if [ "$ACTION" = "install" ]; then
   echo "选择的语言: $LANG_CODE"
-  if [ -n "$SKIP_ASAR_ARG" ]; then
-    echo "安全模式: 跳过结构性 app.asar 补丁，仅应用等长菜单汉化补丁"
-  fi
+  echo "说明: 只安装中文资源与前端汉化，不改写 app.asar；官方账号界面请使用 Claude 自带语言设置。"
   echo
 fi
 
+
 NEEDS_SUDO=1
-if [ "$ACTION" = "disable-updates" ] || [ "$ACTION" = "enable-updates" ]; then
+if [ "$ACTION" = "sync-skills" ] || [ "$ACTION" = "unsync-skills" ]; then
   NEEDS_SUDO=0
 fi
-for arg in "$@"; do
-  if [ "$arg" = "--dry-run" ]; then
-    NEEDS_SUDO=0
-  fi
-done
+if [ "$DRY_RUN" -eq 1 ]; then
+  NEEDS_SUDO=0
+fi
 
 if [ "$(id -u)" -ne 0 ] && [ "$NEEDS_SUDO" -eq 1 ]; then
+  # Clean up frida resident before restore (runs as current user, not root)
+  if [ "$ACTION" = "restore" ]; then
+    LABEL="com.claude-desktop-zh-cn.frida-zh"
+    PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+    if [ -f "$PLIST" ]; then
+      launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+      launchctl unload "$PLIST" 2>/dev/null || true
+      rm -f "$PLIST"
+      echo "已卸载系统常驻 frida-zh。"
+    fi
+    pkill -f "frida_launch_zh.py" 2>/dev/null || true
+    pkill -f "frida-zh-resident-ctl.sh watch" 2>/dev/null || true
+    pkill -9 -f "frida-helper" 2>/dev/null || true
+    if [ -d "$HOME/.claude-zh" ]; then
+      rm -rf "$HOME/.claude-zh"
+      echo "已清理部署目录: $HOME/.claude-zh"
+    fi
+    if [ -d "$HOME/.cache/frida" ]; then
+      rm -rf "$HOME/.cache/frida"
+      echo "已清理 Frida 缓存: $HOME/.cache/frida"
+    fi
+  fi
   echo "需要管理员权限来替换 /Applications/Claude.app。"
   echo "请按提示输入这台 Mac 的登录密码。"
   echo
   if [ "$ACTION" = "restore" ]; then
     sudo "$PYTHON" "$PATCHER" --user-home "$HOME" --restore --launch "$@"
+  elif [ "$ACTION" = "disable-updates" ]; then
+    sudo "$PYTHON" "$PATCHER" --user-home "$HOME" --set-auto-updates disabled "$@"
+  elif [ "$ACTION" = "enable-updates" ]; then
+    sudo "$PYTHON" "$PATCHER" --user-home "$HOME" --set-auto-updates enabled "$@"
   else
-    sudo "$PYTHON" "$PATCHER" --user-home "$HOME" --lang "$LANG_CODE" --launch ${SKIP_ASAR_ARG:+"$SKIP_ASAR_ARG"} "$@"
+    sudo "$PYTHON" "$PATCHER" --user-home "$HOME" --lang "$LANG_CODE" --launch "$@"
   fi
   STATUS=$?
   echo
@@ -149,13 +196,38 @@ if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
 fi
 
 if [ "$ACTION" = "restore" ]; then
+  # Also remove frida resident LaunchAgent if present
+  LABEL="com.claude-desktop-zh-cn.frida-zh"
+  PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+  if [ -f "$PLIST" ]; then
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    launchctl unload "$PLIST" 2>/dev/null || true
+    rm -f "$PLIST"
+    pkill -f "frida_launch_zh.py" 2>/dev/null || true
+    pkill -f "frida-zh-resident-ctl.sh watch" 2>/dev/null || true
+    pkill -9 -f "frida-helper" 2>/dev/null || true
+    echo "已卸载系统常驻 frida-zh。"
+  fi
+  # Clean up deployed directory
+  if [ -d "$HOME/.claude-zh" ]; then
+    rm -rf "$HOME/.claude-zh"
+    echo "已清理部署目录: $HOME/.claude-zh"
+  fi
+  if [ -d "$HOME/.cache/frida" ]; then
+    rm -rf "$HOME/.cache/frida"
+    echo "已清理 Frida 缓存: $HOME/.cache/frida"
+  fi
   "$PYTHON" "$PATCHER" --user-home "$USER_HOME" --restore --launch "$@"
 elif [ "$ACTION" = "disable-updates" ]; then
   "$PYTHON" "$PATCHER" --user-home "$USER_HOME" --set-auto-updates disabled "$@"
 elif [ "$ACTION" = "enable-updates" ]; then
   "$PYTHON" "$PATCHER" --user-home "$USER_HOME" --set-auto-updates enabled "$@"
+elif [ "$ACTION" = "sync-skills" ]; then
+  "$PYTHON" "$PATCHER" --user-home "$USER_HOME" --sync-cc-switch-skills "$@"
+elif [ "$ACTION" = "unsync-skills" ]; then
+  "$PYTHON" "$PATCHER" --user-home "$USER_HOME" --unsync-cc-switch-skills "$@"
 else
-  "$PYTHON" "$PATCHER" --user-home "$USER_HOME" --lang "$LANG_CODE" --launch ${SKIP_ASAR_ARG:+"$SKIP_ASAR_ARG"} "$@"
+  "$PYTHON" "$PATCHER" --user-home "$USER_HOME" --lang "$LANG_CODE" --launch "$@"
 fi
 
 echo

@@ -1,16 +1,22 @@
-﻿param(
+﻿# 本汉化包只处理第三方 API 模式。Claude 官方已原生支持简体/繁体中文界面，
+# 在线账号模式的中文化交给官方实现。Windows 不修改 app.asar；Claude 4.29+
+# 将前端放进 ion-dist.asar 时，必须重建该包并同步 Claude.exe 内嵌的 ASAR
+# 头哈希，因此这种新布局下 Claude.exe 的 Authenticode 签名会失效。
+param(
     [switch]$Interactive,
-    [switch]$SkipAsarPatch,
-    [ValidateSet("safe", "official", "full")]
-    [string]$PatchMode = "full",
 
     [Parameter(Position = 0)]
-    [ValidateSet("install", "uninstall", "disable-updates", "enable-updates")]
+    [ValidateSet("install", "uninstall", "disable-updates", "enable-updates", "sync-skills", "unsync-skills")]
     [string]$Action = "install",
 
     [Parameter(Position = 1)]
     [ValidateSet("zh-CN", "zh-TW", "zh-HK")]
-    [string]$Language = "zh-CN"
+    [string]$Language = "zh-CN",
+
+    [string]$OriginalUserSid = "",
+    [string]$OriginalUserProfile = "",
+    [string]$OriginalAppData = "",
+    [string]$OriginalLocalAppData = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,15 +24,19 @@ $ErrorActionPreference = "Stop"
 $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 $BaseLanguageList = '["en-US","de-DE","fr-FR","ko-KR","ja-JP","es-419","es-ES","it-IT","hi-IN","pt-BR","id-ID"'
 $LanguageListPattern = [System.Text.RegularExpressions.Regex]::Escape($BaseLanguageList) + '(?:(?:,"zh-CN")|(?:,"zh-TW")|(?:,"zh-HK"))*\]'
-$AsarPatchTarget = ".vite/build/index.js"
 $AsarIntegrityBlockSize = 4 * 1024 * 1024
-$OnlineLocaleMainMarker = "__claudeZhOnlineLocaleMain"
-$OnlineTranslationMaxSourceLength = 240
 $script:CurrentBackupSetPath = $null
 $script:DetectedUnpackagedClaudePaths = @()
 $script:DetectedMultipleClaudeInstalls = $false
 $script:InstallLogPath = $null
 $script:InstallTranscriptStarted = $false
+$script:PreInstallCleanupDone = $false
+$script:SkipFrontendFileBackups = $false
+
+if ($OriginalUserSid) { $env:CLAUDE_ZH_ORIGINAL_USER_SID = $OriginalUserSid }
+if ($OriginalUserProfile) { $env:CLAUDE_ZH_ORIGINAL_USER_PROFILE = $OriginalUserProfile }
+if ($OriginalAppData) { $env:CLAUDE_ZH_ORIGINAL_APPDATA = $OriginalAppData }
+if ($OriginalLocalAppData) { $env:CLAUDE_ZH_ORIGINAL_LOCALAPPDATA = $OriginalLocalAppData }
 
 function Start-InstallLog {
     try {
@@ -114,82 +124,93 @@ Test-GitHubReleaseUpdate
 function Read-InteractiveSelection {
     Write-Host "=== Claude Desktop Windows 中文补丁 ==="
     Write-Host ""
-    Write-Host "[1] 安装中文补丁(第三方 API 登录方式：Cowork 安全模式，第三方模型请用 ccswitch/别名映射)"
-    Write-Host "[2] 安装中文补丁(官方账号登录方式：Cowork 沙箱/工作区不可用)"
-    Write-Host "[3] 安装中文补丁(第三方 API 登录方式：同时去除模型限制；Cowork 沙箱/工作区不可用)"
-    Write-Host "[4] 恢复原样 / 卸载补丁"
-    Write-Host "[5] 禁止自动更新"
-    Write-Host "[6] 允许自动更新"
+    Write-Host "[1] 安装中文补丁（第三方 API 模式，例如 DeepSeek；不会改动 app.asar）"
+    Write-Host "    官方账号登录界面已由 Claude 原生提供中文，无需本补丁。"
+    Write-Host "[2] 恢复原样 / 卸载补丁"
+    Write-Host "[3] 自动更新设置（y=禁止自动更新，n=允许自动更新）"
+    Write-Host "[4] 同步 CC Switch skills（y=开启同步，n=删除同步）"
     Write-Host "[Q] 退出"
     Write-Host ""
 
-    $patchModeForInstall = "full"
     $actionSelected = $false
+    $selectedAction = "install"
     while (-not $actionSelected) {
         $actionSelection = (Read-Host "请选择操作 [1/2/3/4/Q]").Trim()
         switch -Regex ($actionSelection) {
-            '^[1]$' { $patchModeForInstall = "safe"; $actionSelected = $true }
-            '^[2]$' { $patchModeForInstall = "official"; $actionSelected = $true }
-            '^[3]$' { $patchModeForInstall = "full"; $actionSelected = $true }
-            '^[4]$' { return @{ Action = "uninstall"; Language = "zh-CN"; PatchMode = "safe" } }
-            '^[5]$' { return @{ Action = "disable-updates"; Language = "zh-CN"; PatchMode = "safe" } }
-            '^[6]$' { return @{ Action = "enable-updates"; Language = "zh-CN"; PatchMode = "safe" } }
+            '^[1]$' { $selectedAction = "install"; $actionSelected = $true }
+            '^[2]$' { return @{ Action = "uninstall"; Language = "zh-CN" } }
+            '^[3]$' {
+                $updateChoice = (Read-Host "是否禁止自动更新？[y=禁止 / n=允许]").Trim()
+                switch -Regex ($updateChoice) {
+                    '^[Yy]$' { return @{ Action = "disable-updates"; Language = "zh-CN" } }
+                    '^[Nn]$' { return @{ Action = "enable-updates"; Language = "zh-CN" } }
+                    default {
+                        Write-Host "无效输入，请输入 y 禁止自动更新，或输入 n 允许自动更新。" -ForegroundColor Yellow
+                        continue
+                    }
+                }
+            }
+            '^[4]$' {
+                $skillsChoice = (Read-Host "是否同步 CC Switch skills？[y=开启同步 / n=删除同步]").Trim()
+                switch -Regex ($skillsChoice) {
+                    '^[Yy]$' { return @{ Action = "sync-skills"; Language = "zh-CN" } }
+                    '^[Nn]$' { return @{ Action = "unsync-skills"; Language = "zh-CN" } }
+                    default {
+                        Write-Host "无效输入，请输入 y 开启同步，或输入 n 删除同步。" -ForegroundColor Yellow
+                        continue
+                    }
+                }
+            }
             '^[Qq]$' { exit 0 }
-            default { Write-Host "请输入 1、2、3、4、5、6 或 Q。" -ForegroundColor Yellow }
+            default { Write-Host "请输入 1、2、3、4 或 Q。" -ForegroundColor Yellow }
         }
     }
 
     Write-Host ""
+    if ($selectedAction -eq "install") {
+        # 预清理只用于“先恢复旧补丁再安装”。它需要定位已安装的 Claude，
+        # 定位失败时不能让整个安装器退出（issue #199：闪退），只提示后继续，
+        # 由后面的安装步骤给出更准确的错误。
+        try {
+            Invoke-PreInstallCleanup
+        }
+        catch {
+            Write-Host ""
+            Write-Host "[警告] 安装前清理旧补丁未完成：$($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "        将继续安装流程。" -ForegroundColor Yellow
+        }
+        Write-Host ""
+    }
+
     Write-Host "请选择要安装的语言："
     Write-Host "[1] 简体中文"
-    Write-Host "[2] 繁体中文（中国台湾）"
-    Write-Host "[3] 繁体中文（中国香港）"
+    Write-Host "[2] 繁體中文（台灣）"
+    Write-Host "[3] 繁體中文（香港）"
     Write-Host "[Q] 退出"
     Write-Host ""
 
     while ($true) {
         $languageSelection = (Read-Host "请选择语言 [1/2/3/Q]").Trim()
         switch -Regex ($languageSelection) {
-            '^[1]$' { return @{ Action = "install"; Language = "zh-CN"; PatchMode = $patchModeForInstall } }
-            '^[2]$' { return @{ Action = "install"; Language = "zh-TW"; PatchMode = $patchModeForInstall } }
-            '^[3]$' { return @{ Action = "install"; Language = "zh-HK"; PatchMode = $patchModeForInstall } }
+            '^[1]$' { return @{ Action = $selectedAction; Language = "zh-CN" } }
+            '^[2]$' { return @{ Action = $selectedAction; Language = "zh-TW" } }
+            '^[3]$' { return @{ Action = $selectedAction; Language = "zh-HK" } }
             '^[Qq]$' { exit 0 }
             default { Write-Host "请输入 1、2、3 或 Q。" -ForegroundColor Yellow }
         }
     }
 }
 
-if ($Interactive) {
-    $interactiveSelection = Read-InteractiveSelection
-    $Action = $interactiveSelection.Action
-    $Language = $interactiveSelection.Language
-    $PatchMode = $interactiveSelection.PatchMode
-}
 
-if ($SkipAsarPatch) {
-    $PatchMode = "safe"
-}
 
-$LanguageCode = $Language
 
-function Test-OnlineAccountPatchEnabled {
-    return $PatchMode -eq "official" -or $PatchMode -eq "full"
-}
-
-function Test-Custom3PPatchEnabled {
-    return $PatchMode -eq "full"
-}
-
-function Test-AsarPatchEnabled {
-    return (Test-OnlineAccountPatchEnabled) -or (Test-Custom3PPatchEnabled)
-}
 
 function Get-LanguageLabel {
     param([string]$Code)
     switch ($Code) {
         "zh-CN" { return "简体中文" }
-        "zh-TW" { return "繁体中文（中国台湾）" }
-        "zh-HK" { return "繁体中文（中国香港）" }
+        "zh-TW" { return "繁體中文（台灣）" }
+        "zh-HK" { return "繁體中文（香港）" }
         default { return $Code }
     }
 }
@@ -215,6 +236,30 @@ function Format-ByteSize {
     return "$Bytes bytes"
 }
 
+function Get-UnpackagedClaudeVersion {
+    param([System.IO.DirectoryInfo]$Directory)
+
+    if ($Directory.Name -notmatch '^app-(\d+(?:\.\d+){1,3})$') {
+        return $null
+    }
+
+    try {
+        return [version]$matches[1]
+    }
+    catch {
+        return $null
+    }
+}
+
+function Test-UnpackagedClaudeAppDirectory {
+    param([System.IO.DirectoryInfo]$Directory)
+
+    $version = Get-UnpackagedClaudeVersion $Directory
+    return ($null -ne $version) -and
+        (Test-Path -LiteralPath (Join-Path $Directory.FullName "Claude.exe")) -and
+        (Test-Path -LiteralPath (Join-Path $Directory.FullName "resources"))
+}
+
 function Get-UnpackagedClaudePaths {
     $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
     if (-not $localAppData) {
@@ -227,7 +272,10 @@ function Get-UnpackagedClaudePaths {
     }
 
     return @(Get-ChildItem $unpackagedBase -Directory -Filter "app-*" -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending |
+        Where-Object { Test-UnpackagedClaudeAppDirectory $_ } |
+        Sort-Object `
+            @{ Expression = { Get-UnpackagedClaudeVersion $_ }; Descending = $true },
+            @{ Expression = { $_.LastWriteTime }; Descending = $true } |
         ForEach-Object { $_.FullName })
 }
 
@@ -237,23 +285,24 @@ function Write-MultipleClaudeFailureHint {
     Write-Host "[提示] 如果失败，请卸载旧版本或手动清理旧 app-* 目录后重试。" -ForegroundColor Yellow
 }
 
-function Write-AsarCoworkSignatureWarning {
-    Write-Host ""
-    Write-Host "[重要] 当前选择会修改 app.asar，并同步改写 Claude.exe 内嵌的 asar 完整性哈希。" -ForegroundColor Yellow
-    Write-Host "[重要] 这会让 Claude.exe 的 Authenticode 签名变为 HashMismatch；Cowork VM 服务会拒绝未通过签名验证的客户端。" -ForegroundColor Yellow
-    Write-Host "[重要] 如果需要 Cowork/截图工作区，请改用模式 1，并在第三方网关或 ccswitch 中把 claude/anthropic 风格模型名映射到实际模型。" -ForegroundColor Yellow
-    Write-Host ""
+
+function Get-ClaudeAppxPackages {
+    # 商店版包名可能调整（issue #194：2.19675.0 起由 Claude 改名为 AnthropicPBC.Claude），
+    # 按名称/发布者模糊匹配，误报由调用方对 resources 目录的校验兜底。
+    return @(Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object {
+            ($_.Name -like "*Claude*") -or ($_.Publisher -like "*Anthropic*")
+        })
 }
 
 function Find-ClaudePath {
-    $packages = @(Get-AppxPackage -Name "Claude" -ErrorAction SilentlyContinue)
+    $packages = @(Get-ClaudeAppxPackages)
     foreach ($package in $packages) {
         if ($package.InstallLocation -and (Test-Path $package.InstallLocation)) {
             return $package.InstallLocation
         }
     }
 
-    $fallback = Get-ChildItem "C:\Program Files\WindowsApps\Claude_*" -Directory -ErrorAction SilentlyContinue |
+    $fallback = Get-ChildItem "C:\Program Files\WindowsApps" -Directory -Filter "*Claude*" -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
     if ($fallback) {
@@ -261,6 +310,23 @@ function Find-ClaudePath {
     }
 
     return $null
+}
+
+function Get-ClaudeExeProductVersion {
+    param([string]$ClaudePath)
+
+    foreach ($name in @("Claude.exe", "claude.exe")) {
+        $exePath = Join-Path $ClaudePath $name
+        if (Test-Path -LiteralPath $exePath) {
+            try {
+                return [string](Get-Item -LiteralPath $exePath).VersionInfo.ProductVersion
+            }
+            catch {
+                return "未知"
+            }
+        }
+    }
+    return "未知"
 }
 
 function Get-ClaudeExePath {
@@ -303,16 +369,31 @@ function Get-ClaudeResourcesPath {
     $script:DetectedUnpackagedClaudePaths = @(Get-UnpackagedClaudePaths)
     $script:DetectedMultipleClaudeInstalls = $false
 
-    if ($script:DetectedUnpackagedClaudePaths.Count -gt 0) {
-        $claudePath = $script:DetectedUnpackagedClaudePaths[0]
-        $resourcesPath = Join-Path $claudePath "resources"
-        if (-not (Test-Path $resourcesPath)) {
-            throw "未找到 Claude resources 目录: $resourcesPath"
+    # 化石目录防线（issue #196）：升级/换渠道安装后，%LocalAppData%\AnthropicClaude
+    # 可能残留旧渠道的 app-* 目录（例如 fast-ring 时代的 app-1.0.x）。它们能通过
+    # Claude.exe + resources 的基础检测，但里面没有前端 bundle；旧逻辑选中这类目录
+    # 后，前几步往空目录里"成功"写入资源，最后在注册语言时才报
+    # "未找到前端 JS bundle"。这里要求候选目录真的能定位到前端 JS，否则跳过并
+    # 尝试下一个候选；全部无效时回退商店版（AppX）检测。
+    $rejectedHints = @()
+    foreach ($candidatePath in $script:DetectedUnpackagedClaudePaths) {
+        $candidateResources = Join-Path $candidatePath "resources"
+        if (-not (Test-Path $candidateResources)) {
+            $rejectedHints += "  跳过 ${candidatePath}（缺少 resources 目录）"
+            continue
         }
+        if (-not (Test-FrontendBundleAvailable $candidateResources)) {
+            $rejectedHints += "  跳过 ${candidatePath}（前端 JS bundle 缺失，版本 $(Get-ClaudeExeProductVersion $candidatePath)，疑似残留旧版本目录）"
+            continue
+        }
+
+        $claudePath = $candidatePath
+        $resourcesPath = $candidateResources
         if ($script:DetectedUnpackagedClaudePaths.Count -gt 1) {
             $script:DetectedMultipleClaudeInstalls = $true
-            Write-Host "  [警告] 检测到多个 %LocalAppData%\AnthropicClaude\app-*，将使用最新版本: $claudePath" -ForegroundColor Yellow
+            Write-Host "  [提示] 检测到多个 %LocalAppData%\AnthropicClaude\app-*，已选用可补丁的最新版本: $claudePath" -ForegroundColor Yellow
         }
+        Write-Host "  Claude 版本: $(Get-ClaudeExeProductVersion $claudePath)" -ForegroundColor DarkGray
         return @{
             App = $claudePath
             Resources = $resourcesPath
@@ -320,16 +401,34 @@ function Get-ClaudeResourcesPath {
         }
     }
 
+    if ($script:DetectedUnpackagedClaudePaths.Count -gt 0) {
+        Write-Host "  [警告] 以下本地 app-* 目录无法作为补丁目标：" -ForegroundColor Yellow
+        foreach ($hint in $rejectedHints) {
+            Write-Host $hint -ForegroundColor Yellow
+        }
+        Write-Host "  [提示] 继续尝试商店版（AppX）安装检测。" -ForegroundColor Yellow
+    }
+
     $claudePath = Find-ClaudePath
     if (-not $claudePath) {
+        if ($script:DetectedUnpackagedClaudePaths.Count -gt 0) {
+            throw "未找到可补丁的 Claude Desktop 安装：本地 app-* 目录均缺前端 bundle，商店版也未检测到。请确认 Claude Desktop 已完整安装（安装后至少启动过一次），或清理旧 app-* 目录后重试。"
+        }
         throw "未找到 Claude Desktop 安装。"
     }
 
     $resourcesPath = Join-Path $claudePath "app\resources"
     if (-not (Test-Path $resourcesPath)) {
-        throw "未找到 Claude resources 目录: $resourcesPath"
+        $resourcesPath = Join-Path $claudePath "resources"
+    }
+    if (-not (Test-Path $resourcesPath)) {
+        throw "未找到 Claude resources 目录: $(Join-Path $claudePath 'app\resources')"
+    }
+    if (-not (Test-FrontendBundleAvailable $resourcesPath)) {
+        throw "未找到可用的前端资源: $resourcesPath\ion-dist 或 $resourcesPath\ion-dist.asar。Claude 前端目录结构可能已变化，请带上安装日志反馈。"
     }
 
+    Write-Host "  Claude 版本: $(Get-ClaudeExeProductVersion $claudePath)" -ForegroundColor DarkGray
     return @{
         App = $claudePath
         Resources = $resourcesPath
@@ -349,7 +448,7 @@ function Get-ClaudeConfigPaths {
     }
 
     $packageNames = @()
-    $packages = @(Get-AppxPackage -Name "Claude" -ErrorAction SilentlyContinue)
+    $packages = @(Get-ClaudeAppxPackages)
     foreach ($package in $packages) {
         if ($package.PackageFamilyName) {
             $packageNames += $package.PackageFamilyName
@@ -358,7 +457,7 @@ function Get-ClaudeConfigPaths {
 
     if ($packageNames.Count -eq 0) {
         $packageRoot = Join-Path $env:LOCALAPPDATA "Packages"
-        $packageDirs = @(Get-ChildItem (Join-Path $packageRoot "Claude_*") -Directory -ErrorAction SilentlyContinue |
+        $packageDirs = @(Get-ChildItem (Join-Path $packageRoot "*Claude_*") -Directory -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending)
         foreach ($packageDir in $packageDirs) {
             $packageNames += $packageDir.Name
@@ -384,10 +483,16 @@ function Grant-WriteAccess {
     try {
         $acl = Get-Acl $Path
         $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $inheritance = if (Test-Path -LiteralPath $Path -PathType Container) {
+            "ContainerInherit,ObjectInherit"
+        }
+        else {
+            "None"
+        }
         $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
             $identity,
             "FullControl",
-            "ContainerInherit,ObjectInherit",
+            $inheritance,
             "None",
             "Allow"
         )
@@ -474,6 +579,9 @@ function Backup-ModifiedFile {
 
     $backupSet = New-BackupSet $ResourcesPath
     $relative = Get-RelativeResourcePath $ResourcesPath $FilePath
+    if ($script:SkipFrontendFileBackups -and ($relative -eq "ion-dist" -or $relative.StartsWith("ion-dist\", [System.StringComparison]::OrdinalIgnoreCase))) {
+        return
+    }
     $target = Join-Path $backupSet $relative
     if (Test-Path $target) {
         return
@@ -577,9 +685,11 @@ function Enable-WriteAccess {
     $paths = @(
         (Get-ClaudeAppPathFromResources $ResourcesPath),
         $ResourcesPath,
+        (Join-Path $ResourcesPath "ion-dist.asar"),
         (Join-Path $ResourcesPath "ion-dist"),
         (Join-Path $ResourcesPath "ion-dist\i18n"),
         (Join-Path $ResourcesPath "ion-dist\i18n\statsig"),
+        (Join-Path $ResourcesPath "ion-dist\i18n\dynamic"),
         (Join-Path $ResourcesPath "ion-dist\assets"),
         (Join-Path $ResourcesPath "ion-dist\assets\v1")
     )
@@ -609,6 +719,19 @@ function Install-LanguageFiles {
 
     Copy-Item $Pack["Statsig"] (Join-Path $statsigDir "$Lang.json") -Force
     Write-Host "  installed ion-dist/i18n/statsig/$Lang.json" -ForegroundColor Green
+
+    # Claude 2.9939.2 起前端强制加载 dynamic catalog，缺失会让整个语言包加载失败并
+    # 回退英文。若项目自带对应的中文 dynamic 词表则优先使用，否则按官方 en-US 原文兜底。
+    $dynamicDir = Join-Path $i18nDir "dynamic"
+    $dynamicEn = Join-Path $dynamicDir "en-US.json"
+    if (Test-Path $dynamicEn) {
+        $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+        $localizedDynamic = Join-Path (Split-Path -Parent $scriptDir) "resources\dynamic-$Lang.json"
+        $dynamicSource = if (Test-Path $localizedDynamic) { $localizedDynamic } else { $dynamicEn }
+        New-Item -ItemType Directory -Path $dynamicDir -Force | Out-Null
+        Copy-Item $dynamicSource (Join-Path $dynamicDir "$Lang.json") -Force
+        Write-Host "  installed ion-dist/i18n/dynamic/$Lang.json" -ForegroundColor Green
+    }
 }
 
 function Align-4 {
@@ -700,205 +823,396 @@ function Read-AsarHeaderFromFile {
     }
 }
 
-function Encode-AsarHeader {
-    param(
-        [string]$HeaderString,
-        [int]$ExpectedHeaderSize
-    )
 
-    $headerBytes = [System.Text.Encoding]::UTF8.GetBytes($HeaderString)
-    $headerPayloadSize = Align-4 (4 + $headerBytes.Length)
-    if ((4 + $headerPayloadSize) -ne $ExpectedHeaderSize) {
-        throw "app.asar header length changed; refusing to write an unsafe patch."
+
+
+
+
+
+
+
+
+
+function Get-FrontendBundleMode {
+    param([string]$ResourcesPath)
+
+    if (Test-Path -LiteralPath (Join-Path $ResourcesPath "ion-dist.asar") -PathType Leaf) {
+        return "Asar"
     }
-
-    $headerPickle = [byte[]]::new($ExpectedHeaderSize)
-    [System.Array]::Copy([System.BitConverter]::GetBytes([uint32]$headerPayloadSize), 0, $headerPickle, 0, 4)
-    [System.Array]::Copy([System.BitConverter]::GetBytes([int32]$headerBytes.Length), 0, $headerPickle, 4, 4)
-    [System.Array]::Copy($headerBytes, 0, $headerPickle, 8, $headerBytes.Length)
-
-    $encoded = [byte[]]::new(8 + $ExpectedHeaderSize)
-    [System.Array]::Copy([System.BitConverter]::GetBytes([uint32]4), 0, $encoded, 0, 4)
-    [System.Array]::Copy([System.BitConverter]::GetBytes([uint32]$ExpectedHeaderSize), 0, $encoded, 4, 4)
-    [System.Array]::Copy($headerPickle, 0, $encoded, 8, $ExpectedHeaderSize)
-    return $encoded
+    if (Test-Path -LiteralPath (Join-Path $ResourcesPath "ion-dist") -PathType Container) {
+        return "Directory"
+    }
+    return "Missing"
 }
 
-function Encode-AsarHeaderDynamic {
-    param([string]$HeaderString)
+function Get-AsarEntryPaths {
+    param($Header)
 
-    $headerBytes = [System.Text.Encoding]::UTF8.GetBytes($HeaderString)
-    $headerPayloadSize = Align-4 (4 + $headerBytes.Length)
-    $headerPickleSize = 4 + $headerPayloadSize
-    $headerPickle = [byte[]]::new($headerPickleSize)
-    [System.Array]::Copy([System.BitConverter]::GetBytes([uint32]$headerPayloadSize), 0, $headerPickle, 0, 4)
-    [System.Array]::Copy([System.BitConverter]::GetBytes([int32]$headerBytes.Length), 0, $headerPickle, 4, 4)
-    [System.Array]::Copy($headerBytes, 0, $headerPickle, 8, $headerBytes.Length)
+    $paths = New-Object System.Collections.Generic.List[string]
+    $walk = {
+        param($Node, [string]$Prefix)
 
-    $encoded = [byte[]]::new(8 + $headerPickleSize)
-    [System.Array]::Copy([System.BitConverter]::GetBytes([uint32]4), 0, $encoded, 0, 4)
-    [System.Array]::Copy([System.BitConverter]::GetBytes([uint32]$headerPickleSize), 0, $encoded, 4, 4)
-    [System.Array]::Copy($headerPickle, 0, $encoded, 8, $headerPickleSize)
-    return $encoded
-}
-
-function Get-AsarFileEntry {
-    param(
-        [object]$Header,
-        [string]$FilePath
-    )
-
-    $node = $Header
-    foreach ($part in $FilePath.Split('/')) {
-        $filesProperty = $node.PSObject.Properties["files"]
-        if (-not $filesProperty) {
-            throw "Could not find $FilePath in app.asar header."
+        if (-not $Node.PSObject.Properties["files"]) {
+            return
         }
-
-        $childProperty = $filesProperty.Value.PSObject.Properties[$part]
-        if (-not $childProperty) {
-            throw "Could not find $FilePath in app.asar header."
-        }
-
-        $node = $childProperty.Value
-    }
-
-    foreach ($key in @("size", "offset", "integrity")) {
-        if (-not $node.PSObject.Properties[$key]) {
-            throw "Missing $key for $FilePath in app.asar header."
-        }
-    }
-
-    return $node
-}
-
-function Add-AsarFileEntries {
-    param(
-        [object]$Node,
-        [System.Collections.Generic.List[object]]$Entries
-    )
-
-    $filesProperty = $Node.PSObject.Properties["files"]
-    if (-not $filesProperty) {
-        return
-    }
-
-    foreach ($childProperty in $filesProperty.Value.PSObject.Properties) {
-        $child = $childProperty.Value
-        if ($child.PSObject.Properties["files"]) {
-            Add-AsarFileEntries $child $Entries
-        } elseif ($child.PSObject.Properties["offset"] -and $child.PSObject.Properties["size"]) {
-            $Entries.Add($child)
-        }
-    }
-}
-
-function Get-AsarFileEntries {
-    param([object]$Header)
-
-    $entries = [System.Collections.Generic.List[object]]::new()
-    Add-AsarFileEntries $Header $entries
-    return $entries
-}
-
-function Set-AsarEntryOffset {
-    param(
-        [object]$Entry,
-        [int64]$Offset
-    )
-
-    if ($Entry.offset -is [string]) {
-        $Entry.offset = [string]$Offset
-    } else {
-        $Entry.offset = $Offset
-    }
-}
-
-function Replace-AsarFileContent {
-    param(
-        [string]$ResourcesPath,
-        [string]$FilePath,
-        [byte[]]$PatchedContent
-    )
-
-    $asarPath = Join-Path $ResourcesPath "app.asar"
-    Require-File $asarPath
-
-    $asarInfo = Get-Item -LiteralPath $asarPath
-    Write-Host "  reading app.asar ($(Format-ByteSize $asarInfo.Length)): $FilePath" -ForegroundColor DarkGray
-    Write-Host "  [进度] 正在读取 app.asar，大文件或共享盘可能需要一些时间..." -ForegroundColor DarkGray
-    $data = [System.IO.File]::ReadAllBytes($asarPath)
-    Write-Host "  [进度] app.asar 读取完成，正在解析 asar 头..." -ForegroundColor DarkGray
-    $parsed = Read-AsarHeader $data $asarPath
-    Write-Host "  [进度] asar 头解析完成，正在定位目标文件..." -ForegroundColor DarkGray
-    $headerSize = $parsed["HeaderSize"]
-    $header = $parsed["Header"]
-    $entry = Get-AsarFileEntry $header $FilePath
-
-    $contentOffset = [int64](8 + $headerSize + [int64]$entry.offset)
-    $contentSize = [int64]$entry.size
-    $contentEnd = $contentOffset + $contentSize
-    if (($contentOffset -lt 0) -or ($contentEnd -gt $data.Length)) {
-        throw "Unsupported app.asar file bounds for $FilePath."
-    }
-
-    $oldContent = [byte[]]::new([int]$contentSize)
-    [System.Array]::Copy($data, [int]$contentOffset, $oldContent, 0, [int]$contentSize)
-    Write-Host "  checking app.asar target content: $(Format-ByteSize $contentSize)" -ForegroundColor DarkGray
-    Write-Host "  [进度] 正在比较旧内容和新补丁内容..." -ForegroundColor DarkGray
-    $contentMatches = $oldContent.Length -eq $PatchedContent.Length
-    if ($contentMatches) {
-        for ($i = 0; $i -lt $oldContent.Length; $i++) {
-            if ($oldContent[$i] -ne $PatchedContent[$i]) {
-                $contentMatches = $false
-                break
+        foreach ($property in $Node.files.PSObject.Properties) {
+            $relative = if ($Prefix) { "$Prefix/$($property.Name)" } else { $property.Name }
+            $child = $property.Value
+            if ($child.PSObject.Properties["files"]) {
+                & $walk $child $relative
+            }
+            else {
+                $paths.Add($relative)
             }
         }
     }
-    if ($contentMatches) {
+    & $walk $Header ""
+    return @($paths)
+}
+
+function Test-AsarFrontendArchive {
+    param([string]$AsarPath)
+
+    if (-not (Test-Path -LiteralPath $AsarPath -PathType Leaf)) {
         return $false
     }
 
-    $targetOffset = [int64]$entry.offset
-    $delta = [int64]$PatchedContent.Length - $contentSize
-    Write-Host "  rebuilding app.asar content: delta=$delta bytes" -ForegroundColor DarkGray
-    Write-Host "  [进度] 正在更新目标文件完整性信息..." -ForegroundColor DarkGray
-    $entry.size = $PatchedContent.Length
-    $entry.integrity = Get-AsarFileIntegrity $PatchedContent
-    if ($delta -ne 0) {
-        foreach ($other in Get-AsarFileEntries $header) {
-            if ((-not [object]::ReferenceEquals($other, $entry)) -and ([int64]$other.offset -gt $targetOffset)) {
-                Set-AsarEntryOffset $other ([int64]$other.offset + $delta)
+    try {
+        $parsed = Read-AsarHeaderFromFile $AsarPath
+        $paths = @(Get-AsarEntryPaths $parsed["Header"])
+        $hasI18n = $paths -contains "i18n/en-US.json"
+        $hasBundle = @($paths | Where-Object { $_ -match '(^|/)assets/(?:[^/]+/)?index-[^/]+\.js$' }).Count -gt 0
+        return ($hasI18n -and $hasBundle)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-FrontendBundleAvailable {
+    param([string]$ResourcesPath)
+
+    $mode = Get-FrontendBundleMode $ResourcesPath
+    if ($mode -eq "Asar") {
+        return Test-AsarFrontendArchive (Join-Path $ResourcesPath "ion-dist.asar")
+    }
+    if ($mode -eq "Directory") {
+        return $null -ne (Resolve-FrontendAssetsDir $ResourcesPath)
+    }
+    return $false
+}
+
+function Expand-AsarArchive {
+    param(
+        [string]$AsarPath,
+        [string]$DestinationPath
+    )
+
+    Require-File $AsarPath
+    if (Test-Path -LiteralPath $DestinationPath) {
+        throw "ASAR 解包目标已存在: $DestinationPath"
+    }
+
+    $parsed = Read-AsarHeaderFromFile $AsarPath
+    $dataStart = 8 + [int]$parsed["HeaderSize"]
+    New-Item -ItemType Directory -Path $DestinationPath -Force | Out-Null
+    $destinationRoot = [IO.Path]::GetFullPath($DestinationPath).TrimEnd('\', '/')
+    $asarStream = [IO.File]::Open($AsarPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $expand = {
+            param($Node, [string]$Prefix)
+
+            foreach ($property in $Node.files.PSObject.Properties) {
+                $name = [string]$property.Name
+                if (-not $name -or $name -in @(".", "..") -or $name.IndexOfAny([char[]]@('/', '\')) -ge 0) {
+                    throw "ASAR 包含不安全路径: $name"
+                }
+                $relative = if ($Prefix) { Join-Path $Prefix $name } else { $name }
+                $target = [IO.Path]::GetFullPath((Join-Path $destinationRoot $relative))
+                if (-not $target.StartsWith($destinationRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                    throw "ASAR 路径越界: $relative"
+                }
+
+                $child = $property.Value
+                if ($child.PSObject.Properties["files"]) {
+                    New-Item -ItemType Directory -Path $target -Force | Out-Null
+                    & $expand $child $relative
+                    continue
+                }
+                if ($child.PSObject.Properties["link"]) {
+                    throw "暂不支持包含软链接的 ASAR: $relative"
+                }
+
+                $parent = Split-Path -Parent $target
+                New-Item -ItemType Directory -Path $parent -Force | Out-Null
+                if ($child.PSObject.Properties["unpacked"] -and [bool]$child.unpacked) {
+                    $unpackedSource = Join-Path ($AsarPath + ".unpacked") ($relative -replace '/', '\')
+                    Require-File $unpackedSource
+                    Copy-Item -LiteralPath $unpackedSource -Destination $target -Force
+                    continue
+                }
+
+                $offset = [int64]$child.offset
+                $size = [int64]$child.size
+                if ($offset -lt 0 -or $size -lt 0 -or ($dataStart + $offset + $size) -gt $asarStream.Length) {
+                    throw "ASAR 文件边界无效: $relative (offset=$offset, size=$size, dataStart=$dataStart, archive=$($asarStream.Length))"
+                }
+
+                $output = [IO.File]::Open($target, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+                try {
+                    $asarStream.Position = $dataStart + $offset
+                    $remaining = $size
+                    $buffer = [byte[]]::new(1024 * 1024)
+                    while ($remaining -gt 0) {
+                        $wanted = [int][Math]::Min([int64]$buffer.Length, $remaining)
+                        $read = $asarStream.Read($buffer, 0, $wanted)
+                        if ($read -le 0) {
+                            throw "ASAR 文件内容不完整: $relative"
+                        }
+                        $output.Write($buffer, 0, $read)
+                        $remaining -= $read
+                    }
+                }
+                finally {
+                    $output.Dispose()
+                }
             }
+        }
+        & $expand $parsed["Header"] ""
+    }
+    finally {
+        $asarStream.Dispose()
+    }
+}
+
+function Get-AsarFileIntegrity {
+    param([string]$Path)
+
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace "-", "").ToLowerInvariant()
+        $blocks = New-Object System.Collections.Generic.List[string]
+        for ($offset = 0; $offset -lt $bytes.Length; $offset += $AsarIntegrityBlockSize) {
+            $length = [Math]::Min($AsarIntegrityBlockSize, $bytes.Length - $offset)
+            $block = [byte[]]::new($length)
+            [Array]::Copy($bytes, $offset, $block, 0, $length)
+            $blocks.Add(([BitConverter]::ToString($sha.ComputeHash($block)) -replace "-", "").ToLowerInvariant())
+        }
+        if ($blocks.Count -eq 0) {
+            $blocks.Add($hash)
+        }
+        return [ordered]@{
+            algorithm = "SHA256"
+            hash = $hash
+            blockSize = $AsarIntegrityBlockSize
+            blocks = @($blocks)
+        }
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function New-AsarArchive {
+    param(
+        [string]$SourceDirectory,
+        [string]$DestinationPath
+    )
+
+    if (-not (Test-Path -LiteralPath $SourceDirectory -PathType Container)) {
+        throw "ASAR 源目录不存在: $SourceDirectory"
+    }
+    if (-not $DestinationPath) {
+        throw "缺少 ASAR 输出路径。"
+    }
+
+    $payloadEntries = New-Object System.Collections.Generic.List[object]
+    $offsetState = [pscustomobject]@{ Offset = [int64]0 }
+
+    $newNode = {
+        param([string]$Directory)
+
+        $node = [ordered]@{ files = [ordered]@{} }
+        $items = @(Get-ChildItem -LiteralPath $Directory -Force | Sort-Object Name)
+        foreach ($item in $items) {
+            if ($item.PSIsContainer) {
+                $node.files[$item.Name] = & $newNode $item.FullName
+                continue
+            }
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq [IO.FileAttributes]::ReparsePoint) {
+                throw "ASAR 源目录包含不支持的软链接: $($item.FullName)"
+            }
+
+            $offset = [int64]$offsetState.Offset
+            $size = [int64]$item.Length
+            $node.files[$item.Name] = [ordered]@{
+                size = $size
+                offset = [string]$offset
+                integrity = Get-AsarFileIntegrity $item.FullName
+            }
+            $payloadEntries.Add([pscustomobject]@{ Path = $item.FullName; Size = $size })
+            $offsetState.Offset += $size
+        }
+        return $node
+    }
+
+    $header = & $newNode ([IO.Path]::GetFullPath($SourceDirectory))
+    $headerString = ConvertTo-Json -InputObject $header -Compress -Depth 100
+    $headerStringBytes = [Text.Encoding]::UTF8.GetBytes($headerString)
+    $headerPayloadSize = Align-4 (4 + $headerStringBytes.Length)
+    $headerSize = 4 + $headerPayloadSize
+    $headerPickle = [byte[]]::new($headerSize)
+    [Array]::Copy([BitConverter]::GetBytes([uint32]$headerPayloadSize), 0, $headerPickle, 0, 4)
+    [Array]::Copy([BitConverter]::GetBytes([int32]$headerStringBytes.Length), 0, $headerPickle, 4, 4)
+    [Array]::Copy($headerStringBytes, 0, $headerPickle, 8, $headerStringBytes.Length)
+
+    $prefix = [byte[]]::new(8)
+    [Array]::Copy([BitConverter]::GetBytes([uint32]4), 0, $prefix, 0, 4)
+    [Array]::Copy([BitConverter]::GetBytes([uint32]$headerSize), 0, $prefix, 4, 4)
+
+    $destinationFull = [IO.Path]::GetFullPath($DestinationPath)
+    $parent = Split-Path -Parent $destinationFull
+    New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    $temporary = "$destinationFull.tmp-" + [guid]::NewGuid().ToString("N")
+    try {
+        $output = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $output.Write($prefix, 0, $prefix.Length)
+            $output.Write($headerPickle, 0, $headerPickle.Length)
+            foreach ($entry in $payloadEntries) {
+                $entryStream = [IO.File]::OpenRead($entry.Path)
+                try {
+                    $entryStream.CopyTo($output)
+                }
+                finally {
+                    $entryStream.Dispose()
+                }
+            }
+        }
+        finally {
+            $output.Dispose()
+        }
+        Move-Item -LiteralPath $temporary -Destination $destinationFull -Force
+    }
+    finally {
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Remove-GeneratedFrontendWorkspace {
+    param(
+        [string]$ResourcesPath,
+        [string]$WorkspacePath
+    )
+
+    if (-not (Test-Path -LiteralPath $WorkspacePath)) {
+        return
+    }
+    $root = [IO.Path]::GetFullPath($ResourcesPath).TrimEnd('\', '/')
+    $target = [IO.Path]::GetFullPath($WorkspacePath).TrimEnd('\', '/')
+    if (-not $target.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase) -or
+        (Split-Path -Leaf $target) -ne "ion-dist") {
+        throw "拒绝清理非安装器工作目录: $WorkspacePath"
+    }
+    Remove-Item -LiteralPath $target -Recurse -Force
+}
+
+function Initialize-FrontendPatchTarget {
+    param([string]$ResourcesPath)
+
+    $mode = Get-FrontendBundleMode $ResourcesPath
+    if ($mode -eq "Missing") {
+        throw "未找到前端资源: $ResourcesPath\ion-dist 或 $ResourcesPath\ion-dist.asar"
+    }
+    if ($mode -eq "Directory") {
+        return [pscustomobject]@{
+            Mode = "Directory"
+            ResourcesPath = $ResourcesPath
+            Generated = $false
+            WorkspacePath = Join-Path $ResourcesPath "ion-dist"
+            AsarPath = $null
+            MarkerPath = $null
         }
     }
 
-    Write-Host "  [进度] 正在拼接新的 app.asar 内容..." -ForegroundColor DarkGray
-    $bodyStart = 8 + $headerSize
-    $body = [System.IO.MemoryStream]::new()
-    $body.Write($data, $bodyStart, [int]($contentOffset - $bodyStart))
-    $body.Write($PatchedContent, 0, $PatchedContent.Length)
-    $tailOffset = [int]$contentEnd
-    $body.Write($data, $tailOffset, $data.Length - $tailOffset)
+    $asarPath = Join-Path $ResourcesPath "ion-dist.asar"
+    $workspacePath = Join-Path $ResourcesPath "ion-dist"
+    $markerPath = Join-Path $ResourcesPath ".zh-cn-asar-extracted"
+    if (Test-Path -LiteralPath $workspacePath) {
+        if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
+            throw "发现未标记的 ion-dist 目录，为避免删除用户文件已停止: $workspacePath"
+        }
+        Remove-GeneratedFrontendWorkspace $ResourcesPath $workspacePath
+    }
+    Remove-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
 
-    Write-Host "  serializing app.asar header" -ForegroundColor DarkGray
-    $updatedHeaderString = $header | ConvertTo-Json -Compress -Depth 100
-    $updatedHeader = Encode-AsarHeaderDynamic $updatedHeaderString
-    Write-Host "  [进度] 正在合并 header 和 body..." -ForegroundColor DarkGray
-    $updatedBody = $body.ToArray()
-    $updated = [byte[]]::new($updatedHeader.Length + $updatedBody.Length)
-    [System.Array]::Copy($updatedHeader, 0, $updated, 0, $updatedHeader.Length)
-    [System.Array]::Copy($updatedBody, 0, $updated, $updatedHeader.Length, $updatedBody.Length)
-
-    Write-Host "  [进度] 正在创建/复用备份..." -ForegroundColor DarkGray
     Backup-ModifiedFile $ResourcesPath $asarPath
-    Write-Host "  writing app.asar: $(Format-ByteSize $updated.Length)" -ForegroundColor DarkGray
-    Write-Host "  [进度] 正在写回 app.asar，请勿关闭窗口..." -ForegroundColor DarkGray
-    [System.IO.File]::WriteAllBytes($asarPath, $updated)
-    Write-Host "  syncing Claude.exe app.asar integrity" -ForegroundColor DarkGray
-    Sync-ClaudeExeAsarIntegrity $ResourcesPath
-    return $true
+    try {
+        Expand-AsarArchive $asarPath $workspacePath
+        [IO.File]::WriteAllText($markerPath, $asarPath, $Utf8NoBom)
+    }
+    catch {
+        Remove-GeneratedFrontendWorkspace $ResourcesPath $workspacePath
+        Remove-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
+        throw
+    }
+
+    $script:SkipFrontendFileBackups = $true
+    Write-Host "  ion-dist.asar 已解包到临时工作目录" -ForegroundColor DarkGray
+    return [pscustomobject]@{
+        Mode = "Asar"
+        ResourcesPath = $ResourcesPath
+        Generated = $true
+        WorkspacePath = $workspacePath
+        AsarPath = $asarPath
+        MarkerPath = $markerPath
+    }
 }
+
+function Complete-FrontendPatchTarget {
+    param($Target)
+
+    if ($null -eq $Target -or $Target.Mode -ne "Asar") {
+        return
+    }
+    if (-not (Test-Path -LiteralPath $Target.WorkspacePath -PathType Container)) {
+        throw "ASAR 临时工作目录不存在: $($Target.WorkspacePath)"
+    }
+
+    $temporaryAsar = $Target.AsarPath + ".zh-cn-new"
+    Remove-Item -LiteralPath $temporaryAsar -Force -ErrorAction SilentlyContinue
+    Write-Host "  正在重新打包 ion-dist.asar..." -ForegroundColor DarkGray
+    New-AsarArchive $Target.WorkspacePath $temporaryAsar
+    try {
+        if (-not (Test-AsarFrontendArchive $temporaryAsar)) {
+            throw "重新打包后的 ion-dist.asar 未通过结构校验。"
+        }
+        Move-Item -LiteralPath $temporaryAsar -Destination $Target.AsarPath -Force
+        Write-Host "  ion-dist.asar 已更新" -ForegroundColor Green
+        Sync-ClaudeExeAsarIntegrity $Target.ResourcesPath
+    }
+    finally {
+        Remove-Item -LiteralPath $temporaryAsar -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Close-FrontendPatchTarget {
+    param($Target)
+
+    try {
+        if ($null -ne $Target -and $Target.Generated) {
+            Remove-GeneratedFrontendWorkspace $Target.ResourcesPath $Target.WorkspacePath
+            Remove-Item -LiteralPath $Target.MarkerPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    finally {
+        $script:SkipFrontendFileBackups = $false
+    }
+}
+
+
+
 
 function Find-BytePattern {
     param(
@@ -927,110 +1241,6 @@ function Find-BytePattern {
     return $matches
 }
 
-function Find-Custom3PValidationToggle {
-    param(
-        [byte[]]$Content,
-        [string]$ExprText
-    )
-
-    $contentText = [System.Text.Encoding]::ASCII.GetString($Content)
-    $pattern = 'const ([A-Za-z_$][A-Za-z0-9_$]*)=' + [regex]::Escape($ExprText) + '\|\|!1,([A-Za-z_$][A-Za-z0-9_$]*)='
-    $validMatches = New-Object System.Collections.Generic.List[object]
-
-    foreach ($match in [regex]::Matches($contentText, $pattern)) {
-        $flagName = $match.Groups[1].Value
-        $windowLength = [Math]::Min(2500, $contentText.Length - $match.Index)
-        $validationWindow = $contentText.Substring($match.Index, $windowLength)
-        if (
-            $validationWindow.Contains(('if(!' + $flagName + ')return{ok:!0}')) -and
-            $validationWindow.Contains('expected a gateway model route referencing an Anthropic model') -and
-            $validationWindow.Contains('Bedrock model')
-        ) {
-            $validMatches.Add($match)
-        }
-    }
-
-    if ($validMatches.Count -gt 1) {
-        throw "Could not patch custom 3P model validation: multiple matching toggles found."
-    }
-    if ($validMatches.Count -eq 1) {
-        return $validMatches[0]
-    }
-    return $null
-}
-
-function Test-Custom3PValidationRemoved {
-    param([byte[]]$Content)
-
-    $contentText = [System.Text.Encoding]::ASCII.GetString($Content)
-    if (
-        (-not $contentText.Contains('expected a gateway model route referencing an Anthropic model')) -and
-        (-not $contentText.Contains('Bedrock model'))
-    ) {
-        return $true
-    }
-    return $false
-}
-
-function Find-Custom3PNameValidator {
-    param(
-        [byte[]]$Content,
-        [bool]$Patched
-    )
-
-    $contentText = [System.Text.Encoding]::ASCII.GetString($Content)
-    $pattern = 'function ([A-Za-z_$][A-Za-z0-9_$]*)\(([A-Za-z_$][A-Za-z0-9_$]*)\)\{const ([A-Za-z_$][A-Za-z0-9_$]*)=\2\.toLowerCase\(\);return ([^{};]+)\}'
-    $validMatches = New-Object System.Collections.Generic.List[object]
-
-    foreach ($match in [regex]::Matches($contentText, $pattern)) {
-        $windowStart = [Math]::Max(0, $match.Index - 1500)
-        $windowLength = [Math]::Min(3000 + ($match.Index - $windowStart), $contentText.Length - $windowStart)
-        $validationWindow = $contentText.Substring($windowStart, $windowLength)
-        if (
-            $validationWindow.Contains('deepseek') -and
-            $validationWindow.Contains('expected a gateway model route referencing an Anthropic model')
-        ) {
-            $expr = $match.Groups[4].Value.Trim()
-            if ($Patched -and ($expr -eq '!0')) {
-                $validMatches.Add($match)
-            }
-            elseif (
-                (-not $Patched) -and
-                $match.Groups[4].Value.Contains('.test(') -and
-                $match.Groups[4].Value.Contains('.some(') -and
-                $match.Groups[4].Value.Contains('.includes(')
-            ) {
-                $validMatches.Add($match)
-            }
-        }
-    }
-
-    if ($validMatches.Count -gt 1) {
-        throw "Could not patch custom 3P model validation: multiple matching validators found."
-    }
-    if ($validMatches.Count -eq 1) {
-        return $validMatches[0]
-    }
-    return $null
-}
-
-function Patch-Custom3PNameValidator {
-    param([byte[]]$Content)
-
-    $match = Find-Custom3PNameValidator $Content $false
-    if ($null -eq $match) {
-        return $false
-    }
-
-    $expr = $match.Groups[4].Value
-    $replacementText = '!0' + (' ' * ($expr.Length - 2))
-    $replacement = [System.Text.Encoding]::ASCII.GetBytes($replacementText)
-    if ($replacement.Length -ne $expr.Length) {
-        throw "Internal patch error: custom 3P validator replacement changed length."
-    }
-    [System.Array]::Copy($replacement, 0, $Content, $match.Groups[4].Index, $replacement.Length)
-    return $true
-}
 
 function Get-Sha256Hex {
     param([byte[]]$Bytes)
@@ -1045,44 +1255,7 @@ function Get-Sha256Hex {
     }
 }
 
-function Get-Sha256HexRange {
-    param(
-        [byte[]]$Bytes,
-        [int]$Offset,
-        [int]$Count
-    )
 
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $hash = $sha.ComputeHash($Bytes, $Offset, $Count)
-        return ([System.BitConverter]::ToString($hash) -replace "-", "").ToLowerInvariant()
-    }
-    finally {
-        $sha.Dispose()
-    }
-}
-
-function Get-AsarFileIntegrity {
-    param([byte[]]$Data)
-
-    $blocks = New-Object System.Collections.Generic.List[string]
-    if ($Data.Length -eq 0) {
-        $blocks.Add((Get-Sha256Hex $Data))
-    }
-    else {
-        for ($offset = 0; $offset -lt $Data.Length; $offset += $AsarIntegrityBlockSize) {
-            $count = [Math]::Min($AsarIntegrityBlockSize, $Data.Length - $offset)
-            $blocks.Add((Get-Sha256HexRange $Data $offset $count))
-        }
-    }
-
-    return [pscustomobject][ordered]@{
-        algorithm = "SHA256"
-        hash = Get-Sha256Hex $Data
-        blockSize = $AsarIntegrityBlockSize
-        blocks = $blocks.ToArray()
-    }
-}
 
 function Get-AsarHeaderHash {
     param([string]$AsarPath)
@@ -1101,60 +1274,146 @@ function Sync-ClaudeExeAsarIntegrity {
     }
     Require-File $exePath
 
-    $asarPath = Join-Path $ResourcesPath "app.asar"
-    Write-Host "  [进度] 正在计算 app.asar header hash..." -ForegroundColor DarkGray
-    $headerHash = Get-AsarHeaderHash $asarPath
-    $marker = 'resources\\app.asar","alg":"SHA256","value":"'
+    $targets = @("app.asar", "ion-dist.asar") | Where-Object {
+        Test-Path -LiteralPath (Join-Path $ResourcesPath $_) -PathType Leaf
+    }
     $exeInfo = Get-Item -LiteralPath $exePath
-    Write-Host "  [进度] 正在读取 Claude.exe ($(Format-ByteSize $exeInfo.Length)) 用于快速定位完整性标记..." -ForegroundColor DarkGray
-    $exeText = [System.IO.File]::ReadAllText($exePath, [System.Text.Encoding]::ASCII)
-    Write-Host "  [进度] 正在用 .NET IndexOf 扫描 Claude.exe 内嵌 app.asar 完整性标记..." -ForegroundColor DarkGray
-    $markerIndex = $exeText.IndexOf($marker, [System.StringComparison]::Ordinal)
-    if ($markerIndex -lt 0) {
-        throw "Could not find Claude.exe app.asar integrity marker. Claude bundle format may have changed."
-    }
-    if ($exeText.IndexOf($marker, $markerIndex + 1, [System.StringComparison]::Ordinal) -ge 0) {
-        throw "Could not find a unique Claude.exe app.asar integrity marker. Claude bundle format may have changed."
-    }
+    Write-Host "  [进度] 正在读取 Claude.exe ($(Format-ByteSize $exeInfo.Length)) 用于定位完整性标记..." -ForegroundColor DarkGray
 
-    $hashOffset = $markerIndex + $marker.Length
-    if (($hashOffset + 64) -gt $exeInfo.Length) {
-        throw "Claude.exe app.asar integrity marker has invalid bounds."
-    }
-
-    $stream = [System.IO.File]::Open($exePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
-    try {
-        $hashBytes = [byte[]]::new(64)
-        $stream.Seek([int64]$hashOffset, [System.IO.SeekOrigin]::Begin) | Out-Null
-        if ($stream.Read($hashBytes, 0, $hashBytes.Length) -ne $hashBytes.Length) {
-            throw "Claude.exe app.asar integrity marker has invalid bounds."
+    foreach ($asarName in $targets) {
+        $asarPath = Join-Path $ResourcesPath $asarName
+        Write-Host "  [进度] 正在计算 $asarName header hash..." -ForegroundColor DarkGray
+        $headerHash = Get-AsarHeaderHash $asarPath
+        $marker = 'resources\\' + $asarName + '","alg":"SHA256","value":"'
+        $exeText = [System.IO.File]::ReadAllText($exePath, [System.Text.Encoding]::ASCII)
+        $markerIndex = $exeText.IndexOf($marker, [System.StringComparison]::Ordinal)
+        if ($markerIndex -lt 0) {
+            throw "Could not find Claude.exe $asarName integrity marker. Claude bundle format may have changed."
         }
-        $currentHash = [System.Text.Encoding]::ASCII.GetString($hashBytes)
+        if ($exeText.IndexOf($marker, $markerIndex + 1, [System.StringComparison]::Ordinal) -ge 0) {
+            throw "Could not find a unique Claude.exe $asarName integrity marker. Claude bundle format may have changed."
+        }
+
+        $hashOffset = $markerIndex + $marker.Length
+        if (($hashOffset + 64) -gt $exeInfo.Length) {
+            throw "Claude.exe $asarName integrity marker has invalid bounds."
+        }
+
+        $stream = [System.IO.File]::Open($exePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
+        try {
+            $hashBytes = [byte[]]::new(64)
+            $stream.Seek([int64]$hashOffset, [System.IO.SeekOrigin]::Begin) | Out-Null
+            if ($stream.Read($hashBytes, 0, $hashBytes.Length) -ne $hashBytes.Length) {
+                throw "Claude.exe $asarName integrity marker has invalid bounds."
+            }
+            $currentHash = [System.Text.Encoding]::ASCII.GetString($hashBytes)
+
+            if ($currentHash -eq $headerHash) {
+                Write-Host "  Claude.exe $asarName integrity already matches" -ForegroundColor Green
+                continue
+            }
+            if ($currentHash -notmatch '^[0-9a-fA-F]{64}$') {
+                throw "Claude.exe $asarName integrity value is not a SHA256 hex string."
+            }
+
+            Backup-AppFile $ResourcesPath $exePath
+            Write-Host "  [进度] 正在定点写回 Claude.exe 中 $asarName 的完整性哈希（64 bytes）..." -ForegroundColor DarkGray
+            $newHashBytes = [System.Text.Encoding]::ASCII.GetBytes($headerHash)
+            $stream.Seek([int64]$hashOffset, [System.IO.SeekOrigin]::Begin) | Out-Null
+            $stream.Write($newHashBytes, 0, $newHashBytes.Length)
+        }
+        finally {
+            $stream.Dispose()
+        }
+        Write-Host "  updated Claude.exe $asarName integrity: $currentHash -> $headerHash" -ForegroundColor Green
     }
-    finally {
-        $stream.Dispose()
+}
+
+function Get-FrontendJsFilesContaining {
+    param(
+        [string]$AssetsDir,
+        [string[]]$Needles
+    )
+
+    $jsFiles = @(Get-ChildItem (Join-Path $AssetsDir "*.js") -File -ErrorAction SilentlyContinue)
+    if ($jsFiles.Count -eq 0) {
+        Write-Host "  [提示] 目录中没有前端 JS 文件: $AssetsDir" -ForegroundColor DarkYellow
+        return @()
     }
 
-    if ($currentHash -eq $headerHash) {
-        Write-Host "  Claude.exe app.asar integrity already matches" -ForegroundColor Green
-        return
+    $patterns = @($Needles | Where-Object { $_ })
+    $keep = 0
+    foreach ($needle in $patterns) {
+        $keep = [Math]::Max($keep, $needle.Length - 1)
     }
-    if ($currentHash -notmatch '^[0-9a-fA-F]{64}$') {
-        throw "Claude.exe app.asar integrity value is not a SHA256 hex string."
+    $matched = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    foreach ($file in $jsFiles) {
+        # StreamReader preserves UTF-8 characters split across reads. Keep enough
+        # overlap for the longest needle, rather than imposing a fixed limit.
+        $reader = [System.IO.StreamReader]::new($file.FullName, [System.Text.Encoding]::UTF8)
+        try {
+            $buffer = [char[]]::new(1024 * 1024)
+            $carry = ""
+            while (($read = $reader.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $chunk = $carry + [string]::new($buffer, 0, $read)
+                foreach ($needle in $patterns) {
+                    if ($chunk.Contains($needle)) {
+                        $matched.Add($file)
+                        $read = -1
+                        break
+                    }
+                }
+                if ($read -lt 0) {
+                    break
+                }
+                $carry = if ($chunk.Length -gt $keep) { $chunk.Substring($chunk.Length - $keep) } else { $chunk }
+            }
+        }
+        finally {
+            $reader.Dispose()
+        }
     }
 
-    Backup-AppFile $ResourcesPath $exePath
-    Write-Host "  [进度] 正在定点写回 Claude.exe 完整性哈希（64 bytes）..." -ForegroundColor DarkGray
-    $newHashBytes = [System.Text.Encoding]::ASCII.GetBytes($headerHash)
-    $stream = [System.IO.File]::Open($exePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
-    try {
-        $stream.Seek([int64]$hashOffset, [System.IO.SeekOrigin]::Begin) | Out-Null
-        $stream.Write($newHashBytes, 0, $newHashBytes.Length)
+    Write-Host "  located $($matched.Count)/$($jsFiles.Count) frontend JS files containing target text" -ForegroundColor DarkGray
+    return @($matched)
+}
+
+function Resolve-FrontendAssetsDir {
+    param([string]$ResourcesPath)
+
+    # 已知布局（Claude 2.x 至 2.31226.1）：ion-dist\assets\v1
+    $known = Join-Path $ResourcesPath "ion-dist\assets\v1"
+    if (Test-Path (Join-Path $known "*.js")) {
+        return $known
     }
-    finally {
-        $stream.Dispose()
+
+    # 兼容未来版本的目录改名/层级变化：在 ion-dist 下递归（限深 3 层）找含 JS
+    # bundle 的目录，优先带 index-*.js 的目录，并用语言白名单锚点确认是前端主
+    # bundle，避免误选 worker 等辅助 JS 目录。
+    $ionDist = Join-Path $ResourcesPath "ion-dist"
+    if (-not (Test-Path $ionDist)) {
+        return $null
     }
-    Write-Host "  updated Claude.exe app.asar integrity: $currentHash -> $headerHash" -ForegroundColor Green
+
+    $probeNeedle = '"en-US","de-DE","fr-FR","ko-KR","ja-JP"'
+    $candidateDirs = @(Get-ChildItem $ionDist -Directory -Recurse -Depth 3 -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path (Join-Path $_.FullName "*.js") } |
+        Sort-Object @{ Expression = { Test-Path (Join-Path $_.FullName "index-*.js") }; Descending = $true })
+    foreach ($dir in $candidateDirs) {
+        $matched = @(Get-FrontendJsFilesContaining $dir.FullName @($probeNeedle))
+        if ($matched.Count -gt 0) {
+            return $dir.FullName
+        }
+    }
+
+    # 锚点扫不到时退而求其次：主 bundle 目录几乎必含 index-*.js
+    foreach ($dir in $candidateDirs) {
+        if (Test-Path (Join-Path $dir.FullName "index-*.js")) {
+            return $dir.FullName
+        }
+    }
+
+    return $null
 }
 
 function Register-Language {
@@ -1163,10 +1422,13 @@ function Register-Language {
         [string]$Lang
     )
 
-    $assetsDir = Join-Path $ResourcesPath "ion-dist\assets\v1"
-    $jsFiles = @(Get-ChildItem (Join-Path $assetsDir "index-*.js") -ErrorAction SilentlyContinue)
+    $assetsDir = Resolve-FrontendAssetsDir $ResourcesPath
+    if (-not $assetsDir) {
+        throw "未找到前端 JS bundle（在 $ResourcesPath\ion-dist 下未定位到前端主 bundle）。Claude 前端目录结构可能已变化，请带上安装日志反馈。"
+    }
+    $jsFiles = @(Get-FrontendJsFilesContaining $assetsDir @('"en-US","de-DE","fr-FR","ko-KR","ja-JP"'))
     if ($jsFiles.Count -eq 0) {
-        throw "未找到前端 index-*.js: $assetsDir"
+        throw "未能注册中文语言：前端 bundle ($assetsDir) 中找不到语言白名单锚点，Claude 前端格式可能已经变化。"
     }
 
     $regex = [System.Text.RegularExpressions.Regex]::new($LanguageListPattern)
@@ -1175,19 +1437,23 @@ function Register-Language {
     $already = 0
     foreach ($file in $jsFiles) {
         $text = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
-        if ($text.Contains($replacement)) {
+        if (-not $regex.IsMatch($text)) {
+            continue
+        }
+
+        # Claude 2.9939.2 起同一 bundle 内有多份语言白名单（导航语言解析与语言可用性
+        # 校验各一份），必须全部补上；正则会吞掉已存在的 zh 项，整体替换是幂等的。
+        $updated = $regex.Replace($text, $replacement)
+        if ($updated -eq $text) {
             Write-Host "  $Lang already registered: $($file.Name)" -ForegroundColor Green
             $already += 1
             continue
         }
 
-        if ($regex.IsMatch($text)) {
-            $updated = $regex.Replace($text, $replacement, 1)
-            Backup-ModifiedFile $ResourcesPath $file.FullName
-            [System.IO.File]::WriteAllText($file.FullName, $updated, $Utf8NoBom)
-            Write-Host "  patched language whitelist for ${Lang}: $($file.Name)" -ForegroundColor Green
-            $changed += 1
-        }
+        Backup-ModifiedFile $ResourcesPath $file.FullName
+        [System.IO.File]::WriteAllText($file.FullName, $updated, $Utf8NoBom)
+        Write-Host "  patched language whitelist for ${Lang}: $($file.Name)" -ForegroundColor Green
+        $changed += 1
     }
 
     if (($changed + $already) -eq 0) {
@@ -1198,14 +1464,19 @@ function Register-Language {
 function Patch-LanguageDisplayNames {
     param([string]$ResourcesPath)
 
-    $assetsDir = Join-Path $ResourcesPath "ion-dist\assets\v1"
-    $jsFiles = @(Get-ChildItem (Join-Path $assetsDir "index-*.js") -ErrorAction SilentlyContinue)
+    $assetsDir = Resolve-FrontendAssetsDir $ResourcesPath
+    $marker = "__claudeZhLabelPatch"
+    if (-not $assetsDir) {
+        Write-Host "  [提示] 未定位到前端 JS bundle，跳过语言显示名补丁。" -ForegroundColor DarkYellow
+        return
+    }
+    $jsFiles = @(Get-FrontendJsFilesContaining $assetsDir @("Intl.DisplayNames", $marker))
     if ($jsFiles.Count -eq 0) {
-        throw "未找到前端 index-*.js: $assetsDir"
+        Write-Host "  no Intl.DisplayNames bundle found; skipping language display names" -ForegroundColor DarkYellow
+        return
     }
 
-    $marker = "__claudeZhLabelPatch"
-    $patch = ';(()=>{const e=Intl.DisplayNames&&Intl.DisplayNames.prototype;if(!e||e.__claudeZhLabelPatch)return;const n=e.of;e.of=function(e){const t=String(e);return t==="zh-CN"?"简体中文":t==="zh-HK"?"繁体中文（中国香港）":t==="zh-TW"?"繁体中文（中国台湾）":n.call(this,e)},Object.defineProperty(e,"__claudeZhLabelPatch",{value:!0})})();'
+    $patch = ';(()=>{const e=Intl.DisplayNames&&Intl.DisplayNames.prototype;if(!e||e.__claudeZhLabelPatch)return;const n=e.of;e.of=function(e){const t=String(e);return t==="zh-CN"?"简体中文":t==="zh-HK"?"繁體中文（香港）":t==="zh-TW"?"繁體中文（台灣）":n.call(this,e)},Object.defineProperty(e,"__claudeZhLabelPatch",{value:!0})})();'
     $patchedFiles = 0
     foreach ($file in $jsFiles) {
         $text = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
@@ -1228,19 +1499,19 @@ function Patch-LanguageDisplayNames {
 function Unregister-Language {
     param([string]$ResourcesPath)
 
-    $assetsDir = Join-Path $ResourcesPath "ion-dist\assets\v1"
-    $jsFiles = @(Get-ChildItem (Join-Path $assetsDir "index-*.js") -ErrorAction SilentlyContinue)
+    $assetsDir = Resolve-FrontendAssetsDir $ResourcesPath
+    if (-not $assetsDir) {
+        # Claude 已被卸载或前端目录无法定位时安静跳过, 不阻断卸载流程
+        Write-Host "  [提示] 未定位到前端 JS bundle($ResourcesPath\ion-dist)，跳过语言注销。" -ForegroundColor DarkYellow
+        return
+    }
+    # 只移除补丁追加到白名单的中文项，保留原生语言对象键和其他语言列表。
+    $jsFiles = @(Get-FrontendJsFilesContaining $assetsDir @('"en-US","de-DE","fr-FR","ko-KR","ja-JP"'))
+    $regex = [System.Text.RegularExpressions.Regex]::new($LanguageListPattern)
     foreach ($file in $jsFiles) {
         $text = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
-        $updated = $text
-        $changed = $false
-        foreach ($lang in @(',"zh-CN"', ',"zh-TW"', ',"zh-HK"')) {
-            if ($updated.Contains($lang)) {
-                $updated = $updated.Replace($lang, '')
-                $changed = $true
-            }
-        }
-        if ($changed) {
+        $updated = $regex.Replace($text, "$BaseLanguageList]")
+        if ($updated -cne $text) {
             [System.IO.File]::WriteAllText($file.FullName, $updated, $Utf8NoBom)
             Write-Host "  removed language whitelist entries: $($file.Name)" -ForegroundColor Green
         }
@@ -1283,17 +1554,57 @@ function Test-PlainUiTextReplacement {
 function Test-StructuralJsReplacement {
     param([string]$Source)
 
-    $structuralStrings = @(
-        "hour", "hours",
-        "minute", "minutes",
-        "second", "seconds",
-        "day", "days",
-        "week", "weeks",
-        "month", "months",
-        "year", "years"
+    # Lowercase single words (hours, tokens, matches...) are object keys or enum
+    # values in the bundled JS, not visible text; they are translated by the DOM layer only.
+    # Structural literal skip list: high-risk words used as icon names, key modifiers,
+    # event suffixes, or core identifiers (#193, #204, #205, #206).
+    $structuralLiterals = @(
+        '"Search"', 'Search',
+        '"Add"', 'Add',
+        '"Copy"', 'Copy',
+        '"Check"', 'Check',
+        '"Tasks"', 'Tasks',
+        '"Settings"', 'Settings',
+        '"Command"', 'Command',
+        '"Cancel"', 'Cancel',
+        '"Sort"', 'Sort',
+        '"Voice"', 'Voice',
+        '"Default"', 'Default',
+        '"Arguments"', 'Arguments',
+        '"Normal"', 'Normal',
+        '"All"', 'All',
+        '"Application"', 'Application',
+        '"Medium"', 'Medium',
+        '"Motion"', 'Motion',
+        '"Thinking"', 'Thinking',
+        '"Verbose"', 'Verbose'
     )
-    $structuralLiterals = @('"Search"')
-    return ($structuralStrings -contains $Source) -or ($structuralLiterals -contains $Source)
+    return ($Source -cmatch '^[a-z][A-Za-z0-9_]*$') -or ($structuralLiterals -contains $Source)
+}
+
+function Test-StructuralJsLiteralContext {
+    param(
+        [string]$Text,
+        [int]$LiteralStart
+    )
+
+    # Protects not only the direct KEY:"X" form but also the minified shapes that
+    # pass icon/enum names as values: destructure defaults (icon:i="Add"), ternary
+    # branches (icon:d?"Check":"Copy", icon:f?"Add":void 0, icon:e.length===0?"A":"B",
+    # nested chains), nullish coalescing (icon:f??"Add") and destructure alias defaults
+    # (icon:c}=e;h=c===void 0?"Add":c, #204). Translating those strings breaks the
+    # icon-name lookup and renders empty button glyphs (#193).
+    $prefixStart = [Math]::Max(0, $LiteralStart - 160)
+    $prefix = $Text.Substring($prefixStart, $LiteralStart - $prefixStart)
+    $aliasPattern = '(?<![A-Za-z0-9_$-])[\w$-]*[Ii]con(?:Name)?\s*:\s*(?<alias>[A-Za-z0-9_$]+)\b.*?(?:=\s*\k<alias>\s*===\s*void 0\s*\?\s*|=\s*\k<alias>\s*!==\s*void 0\s*\?\s*\k<alias>\s*:\s*|(?<![A-Za-z0-9_$-])\k<alias>\s*\?\?\s*)$'
+    if ([System.Text.RegularExpressions.Regex]::IsMatch($prefix, $aliasPattern)) {
+        return $true
+    }
+    $shortPrefix = if ($prefix.Length -gt 96) { $prefix.Substring($prefix.Length - 96) } else { $prefix }
+    return [System.Text.RegularExpressions.Regex]::IsMatch(
+        $shortPrefix,
+        '(?<![A-Za-z0-9_$-])(?:as|component|displayName|glyph|[\w$-]*[Ii]con(?:Name)?|name|role|type)\s*[:=]\s*(?:(?:(?:(?:[^?:"''`,;{}]|"[^"]{0,60}"|''[^'']{0,60}''|`[^`]{0,60}`){1,120}?)\?\??\s*(?:"[^"]{0,80}"|''[^'']{0,80}''|`[^`]{0,80}`)\s*:\s*)*)(?:(?:(?:[^?:"''`,;{}]|"[^"]{0,60}"|''[^'']{0,60}''|`[^`]{0,60}`){1,120}?)(?:\?\??)?\s*)?(?:=\s*)?$'
+    )
 }
 
 function Replace-FrontendHardcodedText {
@@ -1331,6 +1642,9 @@ function Replace-FrontendHardcodedText {
         $pattern,
         {
             param($match)
+            if (Test-StructuralJsLiteralContext $Text $match.Index) {
+                return $match.Value
+            }
             $script:__frontendReplacementCount += 1
             $quote = $match.Groups["quote"].Value
             return "$quote$Target$quote"
@@ -1341,322 +1655,124 @@ function Replace-FrontendHardcodedText {
     return @{ Text = $patched; Count = $count }
 }
 
-function Test-OnlineDomTranslationEntry {
-    param(
-        [string]$Source,
-        [string]$Target
-    )
 
-    if ([string]::IsNullOrEmpty($Source) -or [string]::IsNullOrEmpty($Target) -or ($Source -eq $Target)) {
-        return $false
-    }
-    if ($Source.Length -gt $OnlineTranslationMaxSourceLength) {
-        return $false
-    }
-    foreach ($fragment in @("<", "{", "`n", "http://", "https://")) {
-        if ($Source.Contains($fragment) -or $Target.Contains($fragment)) {
-            return $false
-        }
-    }
-    return $true
-}
 
-function Get-OnlineTranslationMap {
-    param(
-        [string]$ResourcesPath,
-        [object]$Pack,
-        [string]$Language
-    )
 
-    $enPath = Join-Path $ResourcesPath "ion-dist\i18n\en-US.json"
-    Require-File $enPath
-    Require-File $Pack["Frontend"]
 
-    Write-Host "  loading online DOM translation sources" -ForegroundColor DarkGray
-    $en = Get-Content $enPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    $zh = Get-Content $Pack["Frontend"] -Raw -Encoding UTF8 | ConvertFrom-Json
-    $mapping = [ordered]@{}
 
-    Write-Host "  collecting frontend i18n DOM strings" -ForegroundColor DarkGray
-    foreach ($property in $en.PSObject.Properties) {
-        $source = [string]$property.Value
-        $targetProperty = $zh.PSObject.Properties[$property.Name]
-        if ($targetProperty) {
-            $target = [string]$targetProperty.Value
-            if (Test-OnlineDomTranslationEntry $source $target) {
-                $mapping[$source] = $target
+
+
+
+
+
+
+$script:FrontendPatcherCSharp = @'
+using System;
+using System.IO;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace ClaudeZhPatch
+{
+    public static class FrontendPatcher
+    {
+        static readonly Regex StructuralContextRe = new Regex(
+            "(?<![A-Za-z0-9_$-])(?:as|component|displayName|glyph|[\\w$-]*[Ii]con(?:Name)?|name|role|type)\\s*[:=]\\s*(?:(?:(?:(?:[^?:\\\"'`,;{}]|\\\"[^\\\"]{0,60}\\\"|'[^']{0,60}'|`[^`]{0,60}`){1,120}?)\\?\\??\\s*(?:\\\"[^\\\"]{0,80}\\\"|'[^']{0,80}'|`[^`]{0,80}`)\\s*:\\s*)*)(?:(?:(?:[^?:\\\"'`,;{}]|\\\"[^\\\"]{0,60}\\\"|'[^']{0,60}'|`[^`]{0,60}`){1,120}?)(?:\\?\\??)?\\s*)?(?:=\\s*)?$");
+
+        static readonly Regex StructuralAliasContextRe = new Regex(
+            "(?<![A-Za-z0-9_$-])[\\w$-]*[Ii]con(?:Name)?\\s*:\\s*(?<alias>[A-Za-z0-9_$]+)\\b.*?(?:=\\s*\\k<alias>\\s*===\\s*void 0\\s*\\?\\s*|=\\s*\\k<alias>\\s*!==\\s*void 0\\s*\\?\\s*\\k<alias>\\s*:\\s*|(?<![A-Za-z0-9_$-])\\k<alias>\\s*\\?\\?\\s*)$");
+
+        static bool IsStructuralJsLiteralContext(string text, int literalStart)
+        {
+            int prefixStart = Math.Max(0, literalStart - 160);
+            string prefix = text.Substring(prefixStart, literalStart - prefixStart);
+            if (StructuralAliasContextRe.IsMatch(prefix))
+            {
+                return true;
             }
+            string shortPrefix = prefix.Length > 96 ? prefix.Substring(prefix.Length - 96) : prefix;
+            return StructuralContextRe.IsMatch(shortPrefix);
+        }
+
+        static int CountOrdinal(string text, string source)
+        {
+            int occurrences = 0;
+            int index = text.IndexOf(source, StringComparison.Ordinal);
+            while (index >= 0)
+            {
+                occurrences++;
+                index = text.IndexOf(source, index + source.Length, StringComparison.Ordinal);
+            }
+            return occurrences;
+        }
+
+        // rules 行结构: [Regex(plain 规则, 直接替换规则为 null), source, target]，顺序与词表一致。
+        // 纯计算：不读盘之外不做任何副作用，变更后的内容写入 outputContents[i]，由调用方备份并写盘。
+        // 返回每个文件的替换计数（未变更为 0）。
+        public static int[] PatchFiles(string[] filePaths, object[][] rules, int maxWorkers, string[] outputContents)
+        {
+            int total = filePaths.Length;
+            int scanned = 0;
+            int[] counts = new int[total];
+            Parallel.For(0, total, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, maxWorkers) }, delegate(int i)
+            {
+                string filePath = filePaths[i];
+                string text = File.ReadAllText(filePath, Encoding.UTF8);
+                string patched = text;
+                int count = 0;
+                for (int r = 0; r < rules.Length; r++)
+                {
+                    object[] rule = rules[r];
+                    string source = (string)rule[1];
+                    if (!patched.Contains(source))
+                    {
+                        continue;
+                    }
+                    Regex regex = (Regex)rule[0];
+                    string target = (string)rule[2];
+                    if (regex != null)
+                    {
+                        string current = patched;
+                        int localCount = 0;
+                        patched = regex.Replace(current, delegate(Match m)
+                        {
+                            if (IsStructuralJsLiteralContext(current, m.Index))
+                            {
+                                return m.Value;
+                            }
+                            localCount++;
+                            return m.Groups["quote"].Value + target + m.Groups["quote"].Value;
+                        });
+                        count += localCount;
+                    }
+                    else
+                    {
+                        int occurrences = CountOrdinal(patched, source);
+                        if (occurrences > 0)
+                        {
+                            patched = patched.Replace(source, target);
+                            count += occurrences;
+                        }
+                    }
+                }
+                if (count > 0 && !string.Equals(patched, text, StringComparison.OrdinalIgnoreCase))
+                {
+                    outputContents[i] = patched;
+                    counts[i] = count;
+                }
+                int done = Interlocked.Increment(ref scanned);
+                if (done % 250 == 0 || done == total)
+                {
+                    Console.WriteLine("  scanned " + done + "/" + total + " JS files");
+                }
+            });
+            return counts;
         }
     }
-
-    Write-Host "  merging hardcoded DOM strings" -ForegroundColor DarkGray
-    foreach ($pair in @(Get-FrontendHardcodedReplacements $Language)) {
-        $source = $pair[0]
-        $target = $pair[1]
-        if (Test-OnlineDomTranslationEntry $source $target) {
-            $mapping[$source] = $target
-        }
-    }
-
-    Write-Host "  prepared online DOM translation map: $($mapping.Count) strings" -ForegroundColor DarkGray
-    return $mapping
 }
-
-function Get-OnlineDomTranslationScript {
-    param(
-        [string]$Language,
-        [object]$Mapping
-    )
-
-    Write-Host "  serializing online DOM translation script" -ForegroundColor DarkGray
-    $mappingJson = $Mapping | ConvertTo-Json -Compress -Depth 100
-    $languageJson = $Language | ConvertTo-Json -Compress
-    if ($Language -eq "zh-CN") {
-        $selectedText = "已选择 `$1 项"
-        $deleteSelectedText = "删除 `$1 个所选项目"
-    } else {
-        $selectedText = "已選擇 `$1 項"
-        $deleteSelectedText = "刪除 `$1 個所選項目"
-    }
-    $selectedTextJson = $selectedText | ConvertTo-Json -Compress
-    $deleteSelectedTextJson = $deleteSelectedText | ConvertTo-Json -Compress
-    $template = @'
-(()=>{try{
-const L=__LANGUAGE__,M=__MAPPING__,ST=__SELECTED_TEXT__,DST=__DELETE_SELECTED_TEXT__;
-localStorage.setItem("spa:locale",L);
-document.documentElement&&document.documentElement.setAttribute("lang",L);
-const N=s=>(s||"").replace(/\s+/g," ").trim();
-const G=[
-[/^Morning, (.+)$/,"早上好，$1"],[/^Good morning, (.+)$/,"早上好，$1"],
-[/^Afternoon, (.+)$/,"下午好，$1"],[/^Good afternoon, (.+)$/,"下午好，$1"],
-[/^Evening, (.+)$/,"晚上好，$1"],[/^Good evening, (.+)$/,"晚上好，$1"],
-[/^It's late-night (.+)$/,"夜深了，$1"],[/^Good night, (.+)$/,"晚安，$1"],
-[/^Delete (\d+) chat$/,"删除 $1 个聊天"],[/^Delete (\d+) chats$/,"删除 $1 个聊天"],
-[/^Move (\d+) chat to a project$/,"将 $1 个聊天移至项目"],[/^Move (\d+) chats to a project$/,"将 $1 个聊天移至项目"],
-[/^Connection needs (\d+) field$/,"连接还需要填写 $1 个字段"],[/^Connection needs (\d+) fields$/,"连接还需要填写 $1 个字段"],
-[/^needs (\d+) field$/,"还需要填写 $1 个字段"],[/^needs (\d+) fields$/,"还需要填写 $1 个字段"],
-[/^Are you sure you want to delete (\d+) chat\? This cannot be undone\.$/,"你确定要删除 $1 个聊天吗？此操作无法撤消。"],
-[/^Are you sure you want to delete (\d+) chats\? This cannot be undone\.$/,"你确定要删除 $1 个聊天吗？此操作无法撤消。"],
-[/^Are you sure you want to permanently delete this chat\? This cannot be undone\.$/,"你确定要永久删除此聊天吗？此操作无法撤消。"],
-[/^Are you sure you want to permanently delete these chats\? This cannot be undone\.$/,"你确定要永久删除这些聊天吗？此操作无法撤消。"],
-[/^(\d+) selected$/,ST],
-[/^Delete (\d+) selected item$/,DST],
-[/^Delete (\d+) selected items$/,DST],
-[/^Mon$/,"周一"],[/^Tue$/,"周二"],[/^Wed$/,"周三"],[/^Thu$/,"周四"],[/^Fri$/,"周五"],[/^Sat$/,"周六"],[/^Sun$/,"周日"]
-];
-const R=s=>{const n=N(s);if(M[n])return M[n];for(const [r,t] of G){const m=n.match(r);if(m)return t.replace("$1",m[1])}};
-const X=new Set(["SCRIPT","STYLE","NOSCRIPT"]);
-function T(){try{const b=document.body||document.documentElement;if(!b)return;const w=document.createTreeWalker(b,NodeFilter.SHOW_TEXT,{acceptNode(n){const p=n.parentElement;if(!p||X.has(p.tagName)||!R(n.nodeValue))return NodeFilter.FILTER_REJECT;return NodeFilter.FILTER_ACCEPT}});let n;while(n=w.nextNode()){const v=R(n.nodeValue);if(v)n.nodeValue=v}document.querySelectorAll("[aria-label],[title],[placeholder],input,textarea").forEach(e=>{["aria-label","title","placeholder","value"].forEach(a=>{try{if(a==="value"&&!(e.matches("input[type=button],input[type=submit]")))return;let v=e.getAttribute?e.getAttribute(a):void 0;if(v==null&&a in e)v=e[a];const t=R(v);if(t){if(e.setAttribute)e.setAttribute(a,t);try{if(a in e)e[a]=t}catch{}}}catch{}})});document.querySelectorAll("a").forEach(e=>{try{const r=e.getBoundingClientRect(),txt=N(e.textContent);if(txt==="Claude"&&r.left<100&&r.top<100)e.style.visibility="hidden"}catch{}})}catch{}}
-T();
-new MutationObserver(()=>{clearTimeout(window.__claudeZhDomTimer);window.__claudeZhDomTimer=setTimeout(T,30)}).observe(document.documentElement,{subtree:true,childList:true,characterData:true,attributes:true});
-}catch(e){}})()
 '@
-    return $template.Replace("__LANGUAGE__", $languageJson).Replace("__MAPPING__", $mappingJson).Replace("__SELECTED_TEXT__", $selectedTextJson).Replace("__DELETE_SELECTED_TEXT__", $deleteSelectedTextJson)
-}
-
-function Remove-ExistingOnlineDomTranslationPatch {
-    param([string]$Text)
-
-    $markerComment = "/*$OnlineLocaleMainMarker*/"
-    $markerIndex = $Text.IndexOf($markerComment, [System.StringComparison]::Ordinal)
-    if ($markerIndex -lt 0) {
-        return @{ Text = $Text; Removed = $false }
-    }
-
-    Write-Host "  [进度] 检测到旧版在线 DOM 补丁标记，正在快速定位旧注入..." -ForegroundColor DarkGray
-    $eventAnchor = '.webContents.on("dom-ready",()=>{'
-    $anchorIndex = $Text.LastIndexOf($eventAnchor, $markerIndex, [System.StringComparison]::Ordinal)
-    if ($anchorIndex -lt 1) {
-        Write-Host "  [警告] 找到旧补丁标记，但无法定位 dom-ready 注入起点；将保留原内容继续。" -ForegroundColor DarkYellow
-        return @{ Text = $Text; Removed = $false }
-    }
-
-    $receiverStart = $anchorIndex - 1
-    while ($receiverStart -ge 0) {
-        $ch = $Text[$receiverStart]
-        $isIdentifierChar = (($ch -ge 'a') -and ($ch -le 'z')) -or (($ch -ge 'A') -and ($ch -le 'Z')) -or (($ch -ge '0') -and ($ch -le '9')) -or ($ch -eq '_') -or ($ch -eq '$')
-        if (-not $isIdentifierChar) {
-            break
-        }
-        $receiverStart -= 1
-    }
-    $receiverStart += 1
-    if ($receiverStart -ge $anchorIndex) {
-        Write-Host "  [警告] 找到旧补丁标记，但无法识别 webContents 变量名；将保留原内容继续。" -ForegroundColor DarkYellow
-        return @{ Text = $Text; Removed = $false }
-    }
-
-    $receiver = $Text.Substring($receiverStart, $anchorIndex - $receiverStart)
-    $bodyStart = $anchorIndex + $eventAnchor.Length
-    $executeNeedle = ";" + $receiver + ".webContents.executeJavaScript("
-    $executeIndex = $Text.LastIndexOf($executeNeedle, $markerIndex, [System.StringComparison]::Ordinal)
-    if (($executeIndex -lt $bodyStart) -or (-not $Text.Substring($markerIndex - 3, 3).Equals("});", [System.StringComparison]::Ordinal))) {
-        Write-Host "  [警告] 找到旧补丁标记，但旧注入结构不符合预期；将保留原内容继续。" -ForegroundColor DarkYellow
-        return @{ Text = $Text; Removed = $false }
-    }
-
-    $body = $Text.Substring($bodyStart, $executeIndex - $bodyStart)
-    $replacement = $receiver + '.webContents.on("dom-ready",()=>{' + $body + '});'
-    $patchedEnd = $markerIndex + $markerComment.Length
-    $patchedText = $Text.Substring(0, $receiverStart) + $replacement + $Text.Substring($patchedEnd)
-    return @{ Text = $patchedText; Removed = $true }
-}
-
-function Find-OnlineDomTranslationHook {
-    param([string]$Text)
-
-    $readyNeedle = "main_view_dom_ready"
-    $eventAnchor = '.webContents.on("dom-ready",()=>{'
-    $handlerEndNeedle = "});"
-
-    Write-Host "  [进度] 正在快速扫描 dom-ready handler..." -ForegroundColor DarkGray
-    $searchIndex = 0
-    $checked = 0
-    while ($true) {
-        $anchorIndex = $Text.IndexOf($eventAnchor, $searchIndex, [System.StringComparison]::Ordinal)
-        if ($anchorIndex -lt 0) {
-            Write-Host "  [进度] 已扫描 $checked 个 dom-ready handler，未找到 main_view_dom_ready handler，准备尝试 legacy 注入点..." -ForegroundColor DarkGray
-            return @{ Success = $false }
-        }
-        $checked += 1
-
-        $bodyStart = $anchorIndex + $eventAnchor.Length
-        $handlerEnd = $Text.IndexOf($handlerEndNeedle, $bodyStart, [System.StringComparison]::Ordinal)
-        if ($handlerEnd -lt $bodyStart) {
-            Write-Host "  [进度] 第 $checked 个 dom-ready handler 结束位置异常，继续查找下一个..." -ForegroundColor DarkGray
-            $searchIndex = $bodyStart
-            continue
-        }
-
-        $body = $Text.Substring($bodyStart, $handlerEnd - $bodyStart).TrimEnd(";")
-        if (-not $body.Contains($readyNeedle)) {
-            $searchIndex = $handlerEnd + $handlerEndNeedle.Length
-            continue
-        }
-
-        Write-Host "  [进度] 已找到包含 main_view_dom_ready 的 dom-ready handler，正在识别 webContents 变量..." -ForegroundColor DarkGray
-        $receiverStart = $anchorIndex - 1
-        while ($receiverStart -ge 0) {
-            $ch = $Text[$receiverStart]
-            $isIdentifierChar = (($ch -ge 'a') -and ($ch -le 'z')) -or (($ch -ge 'A') -and ($ch -le 'Z')) -or (($ch -ge '0') -and ($ch -le '9')) -or ($ch -eq '_') -or ($ch -eq '$')
-            if (-not $isIdentifierChar) {
-                break
-            }
-            $receiverStart -= 1
-        }
-        $receiverStart += 1
-        if ($receiverStart -ge $anchorIndex) {
-            Write-Host "  [进度] 无法识别 webContents 变量名，继续查找下一个 handler..." -ForegroundColor DarkGray
-            $searchIndex = $handlerEnd + $handlerEndNeedle.Length
-            continue
-        }
-
-        $receiver = $Text.Substring($receiverStart, $anchorIndex - $receiverStart)
-        $hookLength = ($handlerEnd + $handlerEndNeedle.Length) - $receiverStart
-        Write-Host "  [进度] 在线 DOM 注入点定位完成：handler=$checked, receiver=$receiver。" -ForegroundColor DarkGray
-        return @{
-            Success = $true
-            Index = $receiverStart
-            Length = $hookLength
-            Receiver = $receiver
-            Body = $body
-        }
-    }
-}
-
-function Patch-OnlineDomTranslation {
-    param(
-        [string]$ResourcesPath,
-        [object]$Pack,
-        [string]$Language
-    )
-
-    $asarPath = Join-Path $ResourcesPath "app.asar"
-    Require-File $asarPath
-
-    Write-Host "  preparing online claude.ai DOM translation patch" -ForegroundColor DarkGray
-    $asarInfo = Get-Item -LiteralPath $asarPath
-    Write-Host "  [进度] 正在读取 app.asar ($(Format-ByteSize $asarInfo.Length))..." -ForegroundColor DarkGray
-    $data = [System.IO.File]::ReadAllBytes($asarPath)
-    Write-Host "  [进度] app.asar 读取完成，正在解析 asar 头..." -ForegroundColor DarkGray
-    $parsed = Read-AsarHeader $data $asarPath
-    Write-Host "  [进度] asar 头解析完成，正在提取 main-process bundle..." -ForegroundColor DarkGray
-    $headerSize = $parsed["HeaderSize"]
-    $header = $parsed["Header"]
-    $entry = Get-AsarFileEntry $header $AsarPatchTarget
-
-    $contentOffset = [int64](8 + $headerSize + [int64]$entry.offset)
-    $contentSize = [int64]$entry.size
-    $contentEnd = $contentOffset + $contentSize
-    if (($contentOffset -lt 0) -or ($contentEnd -gt $data.Length)) {
-        throw "Unsupported app.asar file bounds for $AsarPatchTarget."
-    }
-
-    $content = [byte[]]::new([int]$contentSize)
-    [System.Array]::Copy($data, [int]$contentOffset, $content, 0, [int]$contentSize)
-    Write-Host "  loaded main-process bundle: $(Format-ByteSize $contentSize)" -ForegroundColor DarkGray
-    Write-Host "  [进度] 正在解码 main-process bundle 文本..." -ForegroundColor DarkGray
-    $text = [System.Text.Encoding]::UTF8.GetString($content)
-    Write-Host "  [进度] 正在快速检查是否已有旧版在线 DOM 补丁标记..." -ForegroundColor DarkGray
-    if ($text.Contains($OnlineLocaleMainMarker)) {
-        $existingPatch = Remove-ExistingOnlineDomTranslationPatch $text
-        $text = $existingPatch["Text"]
-        $hadExisting = [bool]$existingPatch["Removed"]
-        if ($hadExisting) {
-            Write-Host "  [进度] 已移除旧版在线 DOM 补丁，继续生成新补丁..." -ForegroundColor DarkGray
-        }
-    } else {
-        Write-Host "  [进度] 未发现旧版在线 DOM 补丁，继续生成新补丁..." -ForegroundColor DarkGray
-        $hadExisting = $false
-    }
-
-    $mapping = Get-OnlineTranslationMap $ResourcesPath $Pack $Language
-    $script = Get-OnlineDomTranslationScript $Language $mapping
-    $scriptLiteral = $script | ConvertTo-Json -Compress
-
-    Write-Host "  locating online DOM translation injection point" -ForegroundColor DarkGray
-    $hookMatch = Find-OnlineDomTranslationHook $text
-    if ($hookMatch["Success"]) {
-        $receiver = $hookMatch["Receiver"]
-        $body = $hookMatch["Body"]
-        $injectedBody = $body + ";" + $receiver + ".webContents.executeJavaScript(" + $scriptLiteral + ").catch(()=>{})"
-        $injection = $receiver + '.webContents.on("dom-ready",()=>{' + $injectedBody + '});/*' + $OnlineLocaleMainMarker + '*/'
-        if ($text.Contains($injection)) {
-            Write-Host "  online claude.ai DOM translation already patched" -ForegroundColor Green
-            return
-        }
-
-        Write-Host "  injecting online DOM translation hook" -ForegroundColor DarkGray
-        $hookIndex = [int]$hookMatch["Index"]
-        $hookLength = [int]$hookMatch["Length"]
-        $patched = $text.Substring(0, $hookIndex) + $injection + $text.Substring($hookIndex + $hookLength)
-        $patchedContent = [System.Text.Encoding]::UTF8.GetBytes($patched)
-        [void](Replace-AsarFileContent $ResourcesPath $AsarPatchTarget $patchedContent)
-        $action = if ($hadExisting) { "refreshed" } else { "patched" }
-        Write-Host "  $action online claude.ai DOM translation: $($mapping.Count) strings" -ForegroundColor Green
-        return
-    }
-
-    $legacyAnchor = 's.webContents.on("dom-ready",()=>{DIA()});'
-    if (-not $text.Contains($legacyAnchor)) {
-        Write-Host "  [警告] 未找到在线 claude.ai DOM 翻译注入点，跳过 app.asar 在线页面补丁；本地中文资源和语言配置会继续安装。" -ForegroundColor DarkYellow
-        return
-    }
-
-    $injection = 's.webContents.on("dom-ready",()=>{DIA();s.webContents.executeJavaScript(' + $scriptLiteral + ').catch(()=>{})});/*' + $OnlineLocaleMainMarker + '*/'
-    if ($text.Contains($injection)) {
-        Write-Host "  online claude.ai DOM translation already patched" -ForegroundColor Green
-        return
-    }
-
-    $anchorIndex = $text.IndexOf($legacyAnchor, [System.StringComparison]::Ordinal)
-    Write-Host "  injecting legacy online DOM translation hook" -ForegroundColor DarkGray
-    $patched = $text.Substring(0, $anchorIndex) + $injection + $text.Substring($anchorIndex + $legacyAnchor.Length)
-    $patchedContent = [System.Text.Encoding]::UTF8.GetBytes($patched)
-    [void](Replace-AsarFileContent $ResourcesPath $AsarPatchTarget $patchedContent)
-    $action = if ($hadExisting) { "refreshed" } else { "patched" }
-    Write-Host "  $action online claude.ai DOM translation: $($mapping.Count) strings" -ForegroundColor Green
-}
 
 function Patch-HardcodedFrontendStrings {
     param(
@@ -1664,462 +1780,218 @@ function Patch-HardcodedFrontendStrings {
         [string]$Language
     )
 
-    $assetsDir = Join-Path $ResourcesPath "ion-dist\assets\v1"
-    $jsFiles = @(Get-ChildItem (Join-Path $assetsDir "*.js") -ErrorAction SilentlyContinue)
-    if ($jsFiles.Count -eq 0) {
-        throw "未找到前端 JS bundle: $assetsDir"
+    $assetsDir = Resolve-FrontendAssetsDir $ResourcesPath
+    if (-not $assetsDir) {
+        throw "未找到前端 JS bundle: $(Join-Path $ResourcesPath 'ion-dist')"
     }
+    $jsFiles = @(Get-ChildItem (Join-Path $assetsDir "*.js") -File -ErrorAction SilentlyContinue)
 
     $replacements = @(Get-FrontendHardcodedReplacements $Language)
+
+    # 预处理：过滤结构性跳过规则，plain 规则一次性编译 Regex，
+    # 避免 (文件 × 规则) 循环里反复拼 pattern、调函数、分配哈希表。
+    $prepared = New-Object 'System.Collections.Generic.List[object[]]'
+    foreach ($pair in $replacements) {
+        $source = [string]$pair[0]
+        $target = [string]$pair[1]
+        if (Test-StructuralJsReplacement $source) {
+            continue
+        }
+        if (Test-PlainUiTextReplacement $source) {
+            $pattern = '(?<quote>["''`])' + [System.Text.RegularExpressions.Regex]::Escape($source) + '\k<quote>'
+            $prepared.Add([object[]]@(
+                [System.Text.RegularExpressions.Regex]::new($pattern),
+                $source,
+                $target
+            ))
+        } else {
+            $prepared.Add([object[]]@($null, $source, $target))
+        }
+    }
+
+    Write-Host "  scanning frontend JS for hardcoded strings: $($jsFiles.Count) files, $($prepared.Count) replacement rules" -ForegroundColor DarkGray
     $patchedFiles = 0
     $patchedStrings = 0
-    foreach ($file in $jsFiles) {
-        $text = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
-        $patched = $text
-        $count = 0
-        foreach ($pair in $replacements) {
-            $source = $pair[0]
-            $target = $pair[1]
-            $result = Replace-FrontendHardcodedText $patched $source $target
-            if ($result["Count"] -gt 0) {
-                $patched = $result["Text"]
-                $count += $result["Count"]
+
+    $patcherReady = $false
+    try {
+        if (-not ("ClaudeZhPatch.FrontendPatcher" -as [type])) {
+            Add-Type -TypeDefinition $script:FrontendPatcherCSharp -ErrorAction Stop
+        }
+        $patcherReady = $true
+    } catch {
+        Write-Host "  native scan helper unavailable ($($_.Exception.Message)); using single-threaded fallback" -ForegroundColor DarkYellow
+    }
+
+    if ($patcherReady) {
+        $filePaths = [string[]]@($jsFiles | ForEach-Object { $_.FullName })
+        $outputContents = [string[]]::new($filePaths.Count)
+        $workers = [Math]::Max(1, [Math]::Min([Environment]::ProcessorCount, 12))
+        $counts = [ClaudeZhPatch.FrontendPatcher]::PatchFiles($filePaths, $prepared.ToArray(), $workers, $outputContents)
+        for ($i = 0; $i -lt $filePaths.Count; $i++) {
+            if ($null -ne $outputContents[$i]) {
+                Backup-ModifiedFile $ResourcesPath $filePaths[$i]
+                [System.IO.File]::WriteAllText($filePaths[$i], $outputContents[$i], $Utf8NoBom)
+                $patchedFiles += 1
+                $patchedStrings += $counts[$i]
+                Write-Host "  patched: $([System.IO.Path]::GetFileName($filePaths[$i])) ($($counts[$i]) replacements)" -ForegroundColor DarkGray
             }
         }
-
-        if ($patched -ne $text) {
-            Backup-ModifiedFile $ResourcesPath $file.FullName
-            [System.IO.File]::WriteAllText($file.FullName, $patched, $Utf8NoBom)
-            $patchedFiles += 1
-            $patchedStrings += $count
+    } else {
+        foreach ($file in $jsFiles) {
+            $text = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
+            $patched = $text
+            $count = 0
+            foreach ($rule in $prepared) {
+                $source = [string]$rule[1]
+                $target = [string]$rule[2]
+                if (-not $patched.Contains($source)) {
+                    continue
+                }
+                $result = Replace-FrontendHardcodedText $patched $source $target
+                if ($result["Count"] -gt 0) {
+                    $patched = $result["Text"]
+                    $count += $result["Count"]
+                }
+            }
+            if ($patched -ne $text) {
+                Backup-ModifiedFile $ResourcesPath $file.FullName
+                [System.IO.File]::WriteAllText($file.FullName, $patched, $Utf8NoBom)
+                $patchedFiles += 1
+                $patchedStrings += $count
+                Write-Host "  patched file: $($file.Name) ($count replacements)" -ForegroundColor DarkGray
+            }
         }
     }
 
     Write-Host "  patched hardcoded frontend strings: $patchedStrings replacements in $patchedFiles files" -ForegroundColor Green
 }
 
-function Patch-Custom3PModelValidation {
-    param([string]$ResourcesPath)
 
-    $asarPath = Join-Path $ResourcesPath "app.asar"
-    Require-File $asarPath
 
-    $oldExpr = [System.Text.Encoding]::ASCII.GetBytes('process.env.NODE_ENV!=="production"')
-    $newExprText = "false".PadRight($oldExpr.Length, " ")
 
-    $data = [System.IO.File]::ReadAllBytes($asarPath)
-    $parsed = Read-AsarHeader $data $asarPath
-    $headerSize = $parsed["HeaderSize"]
-    $header = $parsed["Header"]
-    $entry = Get-AsarFileEntry $header $AsarPatchTarget
 
-    $contentOffset = [int64](8 + $headerSize + [int64]$entry.offset)
-    $contentSize = [int64]$entry.size
-    $contentEnd = $contentOffset + $contentSize
-    if (($contentOffset -lt 0) -or ($contentEnd -gt $data.Length)) {
-        throw "Unsupported app.asar file bounds for $AsarPatchTarget."
-    }
 
-    $content = [byte[]]::new([int]$contentSize)
-    [System.Array]::Copy($data, [int]$contentOffset, $content, 0, [int]$contentSize)
-    $match = Find-Custom3PValidationToggle $content 'process.env.NODE_ENV!=="production"'
-    if ($null -eq $match) {
-        $patchedMatch = Find-Custom3PValidationToggle $content $newExprText
-        if ($null -ne $patchedMatch) {
-            Write-Host "  custom 3P model-name validation already patched" -ForegroundColor Green
-            Sync-ClaudeExeAsarIntegrity $ResourcesPath
-            return
-        }
-        $patchedNameValidator = Find-Custom3PNameValidator $content $true
-        if ($null -ne $patchedNameValidator) {
-            Write-Host "  custom 3P model-name validation already patched" -ForegroundColor Green
-            Sync-ClaudeExeAsarIntegrity $ResourcesPath
-            return
-        }
-        if (-not (Patch-Custom3PNameValidator $content)) {
-            if (Test-Custom3PValidationRemoved $content) {
-                Write-Host "  custom 3P model-name validation not present (removed in this Claude version)" -ForegroundColor Green
-                return
-            }
-            throw "Could not patch custom 3P model validation. Claude bundle format may have changed."
+
+function Get-SlashCommandGlossConfig {
+    param([string]$Language)
+
+    $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+    $resources = Join-Path (Split-Path -Parent $scriptDir) 'resources'
+    $profile = Get-Content -LiteralPath (Join-Path $resources 'slash-command-menu-patch.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    $catalogs = Get-Content -LiteralPath (Join-Path $resources 'slash-command-glosses.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    $languageProperty = $catalogs.PSObject.Properties[$Language]
+    if ($null -eq $languageProperty) { throw "Unsupported slash command gloss language: $Language" }
+    $labels = $languageProperty.Value
+    if (@($labels.PSObject.Properties).Count -eq 0) { throw 'Empty slash command gloss catalog' }
+    foreach ($property in $labels.PSObject.Properties) {
+        if ($property.Name -cnotmatch '^[a-z][a-z0-9-]*$' -or $property.Value -isnot [string] -or -not $property.Value.Trim()) {
+            throw 'Invalid slash command gloss catalog'
         }
     }
-    else {
-        $anchorText = $match.Value
-        $patchedAnchorText = 'const ' + $match.Groups[1].Value + '=' + $newExprText + '||!1,' + $match.Groups[2].Value + '='
-        $anchor = [System.Text.Encoding]::ASCII.GetBytes($anchorText)
-        $patchedAnchor = [System.Text.Encoding]::ASCII.GetBytes($patchedAnchorText)
-        if ($anchor.Length -ne $patchedAnchor.Length) {
-            throw "Internal patch error: custom 3P validation replacement changed length."
-        }
-
-        $matchOffset = $match.Index
-        [System.Array]::Copy($patchedAnchor, 0, $content, $matchOffset, $patchedAnchor.Length)
-    }
-
-    Backup-ModifiedFile $ResourcesPath $asarPath
-    [System.Array]::Copy($content, 0, $data, [int]$contentOffset, $content.Length)
-
-    $entry.integrity = Get-AsarFileIntegrity $content
-    $updatedHeaderString = $header | ConvertTo-Json -Compress -Depth 100
-    $updatedHeader = Encode-AsarHeader $updatedHeaderString $headerSize
-    [System.Array]::Copy($updatedHeader, 0, $data, 0, $updatedHeader.Length)
-
-    [System.IO.File]::WriteAllBytes($asarPath, $data)
-    Sync-ClaudeExeAsarIntegrity $ResourcesPath
-    Write-Host "  patched custom 3P model-name validation in app.asar" -ForegroundColor Green
+    return @{ Profile = $profile; Labels = $labels }
 }
 
-function Patch-CoworkModernInstallerCheck {
-    param([string]$ResourcesPath)
+function Get-SlashGlossReplacement {
+    param($Match, $Profile, [switch]$Patched)
 
-    $asarPath = Join-Path $ResourcesPath "app.asar"
-    Require-File $asarPath
-
-    $data = [System.IO.File]::ReadAllBytes($asarPath)
-    $parsed = Read-AsarHeader $data $asarPath
-    $headerSize = $parsed["HeaderSize"]
-    $header = $parsed["Header"]
-    $entry = Get-AsarFileEntry $header $AsarPatchTarget
-
-    $contentOffset = [int64](8 + $headerSize + [int64]$entry.offset)
-    $contentSize = [int64]$entry.size
-    $contentEnd = $contentOffset + $contentSize
-    if (($contentOffset -lt 0) -or ($contentEnd -gt $data.Length)) {
-        throw "Unsupported app.asar file bounds for $AsarPatchTarget."
-    }
-
-    $content = [byte[]]::new([int]$contentSize)
-    [System.Array]::Copy($data, [int]$contentOffset, $content, 0, [int]$contentSize)
-    $contentText = [System.Text.Encoding]::ASCII.GetString($content)
-
-    if (
-        $contentText.Contains('function _I(){return mo?(XX="patched",sP=!0,!0):!1}') -or
-        $contentText.Contains('function LI(){return io?(nAA="patched",A2=!0,!0):!1}')
-    ) {
-        Write-Host "  Cowork modern installer check already patched" -ForegroundColor Green
-        Sync-ClaudeExeAsarIntegrity $ResourcesPath
-        return
-    }
-
-    $patches = @(
-        @{
-            Source = 'function _I(){return mo?sP!==void 0?sP:process.windowsStore?(XX="windowsStore",sP=!0,!0):uVe()?(XX="appPath",sP=!0,!0):(XX=null,sP=!1,!1):!1}'
-            Target = 'function _I(){return mo?(XX="patched",sP=!0,!0):!1}'
-        },
-        @{
-            Source = 'function LI(){return io?A2!==void 0?A2:process.windowsStore?(nAA="windowsStore",A2=!0,!0):pje()?(nAA="appPath",A2=!0,!0):(nAA=null,A2=!1,!1):!1}'
-            Target = 'function LI(){return io?(nAA="patched",A2=!0,!0):!1}'
-        }
-    )
-
-    $selectedPatch = $null
-    $sourceIndex = -1
-    foreach ($candidate in $patches) {
-        $source = [string]$candidate["Source"]
-        $candidateIndex = $contentText.IndexOf($source, [System.StringComparison]::Ordinal)
-        if ($candidateIndex -lt 0) {
-            continue
-        }
-        if ($contentText.IndexOf($source, $candidateIndex + $source.Length, [System.StringComparison]::Ordinal) -ge 0) {
-            Write-Host "  [警告] Cowork modern installer check 匹配到多个候选，跳过该补丁；中文补丁和第三方模型名补丁已继续保留。" -ForegroundColor DarkYellow
-            return
-        }
-        $selectedPatch = $candidate
-        $sourceIndex = $candidateIndex
-        break
-    }
-
-    if ($null -eq $selectedPatch) {
-        Write-Host "  [警告] 未找到 Cowork modern installer check 补丁点，跳过该补丁；中文补丁和第三方模型名补丁已继续保留。" -ForegroundColor DarkYellow
-        return
-    }
-
-    $source = [string]$selectedPatch["Source"]
-    $target = [string]$selectedPatch["Target"]
-    if ($target.Length -gt $source.Length) {
-        throw "Internal patch error: Cowork installer check replacement is longer than source."
-    }
-    $target = $target.PadRight($source.Length, " ")
-
-    $replacement = [System.Text.Encoding]::ASCII.GetBytes($target)
-    [System.Array]::Copy($replacement, 0, $content, $sourceIndex, $replacement.Length)
-
-    Backup-ModifiedFile $ResourcesPath $asarPath
-    [System.Array]::Copy($content, 0, $data, [int]$contentOffset, $content.Length)
-
-    $entry.integrity = Get-AsarFileIntegrity $content
-    $updatedHeaderString = $header | ConvertTo-Json -Compress -Depth 100
-    $updatedHeader = Encode-AsarHeader $updatedHeaderString $headerSize
-    [System.Array]::Copy($updatedHeader, 0, $data, 0, $updatedHeader.Length)
-
-    [System.IO.File]::WriteAllBytes($asarPath, $data)
-    Sync-ClaudeExeAsarIntegrity $ResourcesPath
-    Write-Host "  patched Cowork modern installer check in app.asar" -ForegroundColor Green
+    $original = $Match.Value.Substring($Match.Value.IndexOf(':') + 1).TrimStart()
+    if ($Patched) { $original = $original.Substring(1) }
+    $values = @{ '__ORIGINAL__' = $original; '__ITEM__' = $Match.Groups[3].Value; '__JSX__' = $Match.Groups[1].Value }
+    return [regex]::Replace($Profile.replacement, '__ORIGINAL__|__ITEM__|__JSX__', { param($token) $values[$token.Value] })
 }
 
-function Patch-HardcodedMainProcessMenuLabels {
-    param(
-        [string]$ResourcesPath,
-        [string]$Language
-    )
+function Convert-SlashCommandMenuText {
+    param([string]$Text, $Profile, $Labels)
 
-    $asarPath = Join-Path $ResourcesPath "app.asar"
-    Require-File $asarPath
-    switch ($Language) {
-        "zh-CN" {
-            $replacements = @(
-                @("File", "文件"),
-                @("Edit", "编辑"),
-                @("View", "查看"),
-                @("Developer", "开发者"),
-                @("Help", "帮助"),
-                @("Extensions", "扩展"),
-                @("Open Developer Config File…", "打开开发者配置文件…"),
-                @("Open Developer Config File...", "打开开发者配置文件..."),
-                @("Configure Third-Party Inference…", "配置第三方推理…"),
-                @("Configure Third-Party Inference...", "配置第三方推理..."),
-                @("Open App Config File…", "打开应用配置文件…"),
-                @("Open App Config File...", "打开应用配置文件..."),
-                @("Reload MCP Configuration", "重新加载 MCP 配置"),
-                @("Open MCP Log File", "打开 MCP 日志文件"),
-                @("Open MCP Log File…", "打开 MCP 日志文件…"),
-                @("Open MCP Log File...", "打开 MCP 日志文件..."),
-                @("Open Hardware Buddy…", "打开硬件伙伴…"),
-                @("Open Hardware Buddy...", "打开硬件伙伴..."),
-                @("Show All Dev Tools", "显示所有开发者工具"),
-                @("Show Dev Tools", "显示开发者工具"),
-                @("Enable Main Process Debugger", "启用主进程调试器"),
-                @("Record Performance Trace", "记录性能跟踪"),
-                @("Write Main Process Heap Snapshot", "写入主进程堆快照"),
-                @("Record Memory Trace (auto-stop)", "记录内存跟踪 (自动)")
-            )
-            $intlReplacements = @(
-                @("0tZLEYF8mJ", "开发者"),
-                @("/PgA81GVOD", "编辑"),
-                @("LCWUQ/4Fu6", "查看"),
-                @("uc3dnSo+eo", "文件"),
-                @("EfdnINFnIz", "文件"),
-                @("pWXxZASpOB", "帮助"),
-                @("JOf7G+dCf1", "打开应用配置文件..."),
-                @("K5GtyaPaw/", "打开开发者配置文件..."),
-                @("RTg057HE1D", "显示开发者工具"),
-                @("STqYpFr7p4", "显示所有开发者工具"),
-                @("rNAd+HxSK4", "打开 MCP 日志文件"),
-                @("PW5U8NgTto", "打开 MCP 日志文件..."),
-                @("uKCcuVd1Yt", "重新加载 MCP 配置"),
-                @("9GRz7bC+rr", "配置第三方推理…")
-            )
-        }
-        "zh-TW" {
-            $replacements = @(
-                @("File", "檔案"),
-                @("Edit", "編輯"),
-                @("View", "檢視"),
-                @("Developer", "開發者"),
-                @("Help", "說明"),
-                @("Extensions", "擴充功能"),
-                @("Open Developer Config File…", "開啟開發者設定檔…"),
-                @("Open Developer Config File...", "開啟開發者設定檔..."),
-                @("Configure Third-Party Inference…", "設定第三方推理…"),
-                @("Configure Third-Party Inference...", "設定第三方推理..."),
-                @("Open App Config File…", "開啟應用程式設定檔…"),
-                @("Open App Config File...", "開啟應用程式設定檔..."),
-                @("Reload MCP Configuration", "重新載入 MCP 設定"),
-                @("Open MCP Log File", "開啟 MCP 記錄檔"),
-                @("Open MCP Log File…", "開啟 MCP 記錄檔…"),
-                @("Open MCP Log File...", "開啟 MCP 記錄檔..."),
-                @("Open Hardware Buddy…", "開啟硬體夥伴…"),
-                @("Open Hardware Buddy...", "開啟硬體夥伴..."),
-                @("Show All Dev Tools", "顯示所有開發者工具"),
-                @("Show Dev Tools", "顯示開發者工具"),
-                @("Enable Main Process Debugger", "啟用主行程偵錯器"),
-                @("Record Performance Trace", "記錄效能追蹤"),
-                @("Write Main Process Heap Snapshot", "寫入主行程堆積快照"),
-                @("Record Memory Trace (auto-stop)", "記錄記憶體追蹤 (自動)")
-            )
-            $intlReplacements = @(
-                @("0tZLEYF8mJ", "開發者"),
-                @("/PgA81GVOD", "編輯"),
-                @("LCWUQ/4Fu6", "檢視"),
-                @("uc3dnSo+eo", "檔案"),
-                @("EfdnINFnIz", "檔案"),
-                @("pWXxZASpOB", "說明"),
-                @("JOf7G+dCf1", "開啟應用程式設定檔..."),
-                @("K5GtyaPaw/", "開啟開發者設定檔..."),
-                @("RTg057HE1D", "顯示開發者工具"),
-                @("STqYpFr7p4", "顯示所有開發者工具"),
-                @("rNAd+HxSK4", "開啟 MCP 記錄檔"),
-                @("PW5U8NgTto", "開啟 MCP 記錄檔..."),
-                @("uKCcuVd1Yt", "重新載入 MCP 設定"),
-                @("9GRz7bC+rr", "設定第三方推理…")
-            )
-        }
-        "zh-HK" {
-            $replacements = @(
-                @("File", "檔案"),
-                @("Edit", "編輯"),
-                @("View", "檢視"),
-                @("Developer", "開發者"),
-                @("Help", "說明"),
-                @("Extensions", "擴充功能"),
-                @("Open Developer Config File…", "開啟開發者設定檔…"),
-                @("Open Developer Config File...", "開啟開發者設定檔..."),
-                @("Configure Third-Party Inference…", "設定第三方推理…"),
-                @("Configure Third-Party Inference...", "設定第三方推理..."),
-                @("Open App Config File…", "開啟應用程式設定檔…"),
-                @("Open App Config File...", "開啟應用程式設定檔..."),
-                @("Reload MCP Configuration", "重新載入 MCP 設定"),
-                @("Open MCP Log File", "開啟 MCP 記錄檔"),
-                @("Open MCP Log File…", "開啟 MCP 記錄檔…"),
-                @("Open MCP Log File...", "開啟 MCP 記錄檔..."),
-                @("Open Hardware Buddy…", "開啟硬件夥伴…"),
-                @("Open Hardware Buddy...", "開啟硬件夥伴..."),
-                @("Show All Dev Tools", "顯示所有開發者工具"),
-                @("Show Dev Tools", "顯示開發者工具"),
-                @("Enable Main Process Debugger", "啟用主行程偵錯器"),
-                @("Record Performance Trace", "記錄效能追蹤"),
-                @("Write Main Process Heap Snapshot", "寫入主行程堆積快照"),
-                @("Record Memory Trace (auto-stop)", "記錄記憶體追蹤 (自動)")
-            )
-            $intlReplacements = @(
-                @("0tZLEYF8mJ", "開發者"),
-                @("/PgA81GVOD", "編輯"),
-                @("LCWUQ/4Fu6", "檢視"),
-                @("uc3dnSo+eo", "檔案"),
-                @("EfdnINFnIz", "檔案"),
-                @("pWXxZASpOB", "說明"),
-                @("JOf7G+dCf1", "開啟應用程式設定檔..."),
-                @("K5GtyaPaw/", "開啟開發者設定檔..."),
-                @("RTg057HE1D", "顯示開發者工具"),
-                @("STqYpFr7p4", "顯示所有開發者工具"),
-                @("rNAd+HxSK4", "開啟 MCP 記錄檔"),
-                @("PW5U8NgTto", "開啟 MCP 記錄檔..."),
-                @("uKCcuVd1Yt", "重新載入 MCP 設定"),
-                @("9GRz7bC+rr", "設定第三方推理…")
-            )
-        }
-        default {
-            throw "Unsupported language for main-process menu labels: $Language"
-        }
+    if (-not [regex]::IsMatch($Text, $Profile.module_pattern)) {
+        throw 'SlashCommandMenuPopupBody export not found'
     }
-
-    $data = [System.IO.File]::ReadAllBytes($asarPath)
-    $parsed = Read-AsarHeader $data $asarPath
-    $headerSize = $parsed["HeaderSize"]
-    $header = $parsed["Header"]
-    $entry = Get-AsarFileEntry $header $AsarPatchTarget
-
-    $contentOffset = [int64](8 + $headerSize + [int64]$entry.offset)
-    $contentSize = [int64]$entry.size
-    $contentEnd = $contentOffset + $contentSize
-    if (($contentOffset -lt 0) -or ($contentEnd -gt $data.Length)) {
-        throw "Unsupported app.asar file bounds for $AsarPatchTarget."
-    }
-
-    $content = [byte[]]::new([int]$contentSize)
-    [System.Array]::Copy($data, [int]$contentOffset, $content, 0, [int]$contentSize)
-    $text = [System.Text.Encoding]::UTF8.GetString($content)
-    $patched = $text
-    $count = 0
-    $intlCount = 0
-    $repairCount = 0
-
-    $unsafeRepairs = @(
-        @("文件", "File"),
-        @("檔案", "File"),
-        @("编辑", "Edit"),
-        @("編輯", "Edit"),
-        @("查看", "View"),
-        @("檢視", "View"),
-        @("帮助", "Help"),
-        @("說明", "Help"),
-        @("开发者", "Developer"),
-        @("開發者", "Developer"),
-        @("扩展", "Extensions"),
-        @("擴充功能", "Extensions")
-    )
-    foreach ($pair in $unsafeRepairs) {
-        $source = $pair[0]
-        $target = $pair[1]
-        $pattern = '(?<quote>["' + "'" + '`])' + [regex]::Escape($source) + '\k<quote>'
-        $script:__menuRepairCount = 0
-        $patched = [regex]::Replace(
-            $patched,
-            $pattern,
-            {
-                param($match)
-                $script:__menuRepairCount += 1
-                return $match.Groups["quote"].Value + $target + $match.Groups["quote"].Value
-            }
-        )
-        $repairCount += $script:__menuRepairCount
-        $script:__menuRepairCount = 0
-    }
-
-    foreach ($pair in $intlReplacements) {
-        $id = $pair[0]
-        $target = $pair[1]
-        $literal = ConvertTo-Json $target -Compress
-        $needle = 'id:"' + $id + '"'
-        $pattern = '[A-Za-z_$][A-Za-z0-9_$]*\(\)\.formatMessage\(\{defaultMessage:"(?:\\.|[^"\\])*",id:"' + [regex]::Escape($id) + '"(?:,description:"(?:\\.|[^"\\])*")?\}\)'
-        $searchStart = 0
-        while ($true) {
-            $idIndex = $patched.IndexOf($needle, $searchStart, [System.StringComparison]::Ordinal)
-            if ($idIndex -lt 0) {
-                break
-            }
-
-            $windowStart = [Math]::Max(0, $idIndex - 600)
-            $windowEnd = [Math]::Min($patched.Length, $idIndex + 600)
-            $window = $patched.Substring($windowStart, $windowEnd - $windowStart)
-            $match = [regex]::Match($window, $pattern)
-            if (-not $match.Success) {
-                $searchStart = $idIndex + $needle.Length
-                continue
-            }
-
-            $absoluteStart = $windowStart + $match.Index
-            $patched = $patched.Substring(0, $absoluteStart) + $literal + $patched.Substring($absoluteStart + $match.Length)
-            $intlCount += 1
-            $searchStart = $absoluteStart + $literal.Length
+    $keys = [string[]]@($Labels.PSObject.Properties.Name)
+    [array]::Sort($keys, [StringComparer]::Ordinal)
+    $orderedLabels = [ordered]@{}
+    foreach ($key in $keys) { $orderedLabels[$key] = $Labels.PSObject.Properties[$key].Value }
+    $encoded = ConvertTo-Json -InputObject $orderedLabels -Compress -Depth 3
+    $encoded = $encoded.Replace([string][char]0x2028, ([string][char]92 + 'u2028')).Replace([string][char]0x2029, ([string][char]92 + 'u2029'))
+    $marker = [string]$Profile.marker
+    $suffix = "`n" + $marker + $Profile.suffix.Replace('__LABELS__', $encoded)
+    if ($Text.Contains($marker)) {
+        $separator = "`n" + $marker
+        if (([regex]::Matches($Text, [regex]::Escape($marker))).Count -ne 1 -or -not $Text.Contains($separator)) {
+            throw 'Ambiguous slash command gloss marker'
         }
-    }
-
-    foreach ($pair in $replacements) {
-        $source = $pair[0]
-        $target = $pair[1]
-        if (-not $patched.Contains($source)) {
-            continue
+        $index = $Text.IndexOf($separator, [StringComparison]::Ordinal)
+        $body = $Text.Substring(0, $index)
+        $tail = $Text.Substring($index + $separator.Length)
+        $parts = $Profile.suffix -split '__LABELS__', 2
+        $left = $parts[0]
+        $right = $parts[1]
+        if (-not $tail.StartsWith($left, [StringComparison]::Ordinal) -or -not $tail.EndsWith($right, [StringComparison]::Ordinal)) {
+            throw 'Unrecognized existing slash command helper'
         }
-
-        $pattern = '(?<prefix>(?<![A-Za-z0-9_$])(?:label|defaultMessage)\s*:\s*)(?<quote>["' + "'" + '`])' + [regex]::Escape($source) + '\k<quote>'
-        $script:__menuReplacementCount = 0
-        $patched = [regex]::Replace(
-            $patched,
-            $pattern,
-            {
-                param($match)
-                $script:__menuReplacementCount += 1
-                return $match.Groups["prefix"].Value + $match.Groups["quote"].Value + $target + $match.Groups["quote"].Value
-            }
-        )
-        $occurrences = $script:__menuReplacementCount
-        $script:__menuReplacementCount = 0
-        $count += $occurrences
+        $previous = $tail.Substring($left.Length, $tail.Length - $left.Length - $right.Length) | ConvertFrom-Json
+        $pattern = $Profile.anchor_pattern.Replace('children:', 'children:\[')
+        $anchors = [regex]::Matches($body, $pattern)
+        if ($anchors.Count -ne 1) { throw 'Existing slash menu row is missing or ambiguous' }
+        $replacement = Get-SlashGlossReplacement $anchors[0] $Profile -Patched
+        $start = $anchors[0].Index
+        if ($body.Length -lt $start + $replacement.Length -or $body.Substring($start, $replacement.Length) -cne $replacement) {
+            throw 'Existing slash menu row does not match the patch'
+        }
+        $same = @($previous.PSObject.Properties).Count -eq $keys.Count
+        foreach ($key in $keys) {
+            $property = $previous.PSObject.Properties[$key]
+            if ($null -eq $property -or $property.Name -cne $key -or $property.Value -cne $orderedLabels[$key]) { $same = $false }
+        }
+        if ($same) { return @{ Text = $Text; Status = 'already' } }
+        return @{ Text = $body + $suffix; Status = 'updated' }
     }
+    if ($Text.Contains('__claudeZhSlashGloss') -or $Text.Contains('__claudeZhSlashLabels')) {
+        throw 'Slash command helper name already exists'
+    }
+    $anchors = [regex]::Matches($Text, $Profile.anchor_pattern)
+    if ($anchors.Count -ne 1) { throw 'Expected exactly one slash menu label anchor' }
+    $anchor = $anchors[0]
+    if (-not [regex]::IsMatch($Text, [regex]::Escape($anchor.Groups[3].Value) + '\.type\s*===\s*"skill"')) {
+        throw 'Slash menu skill row not found'
+    }
+    $replacement = Get-SlashGlossReplacement $anchor $Profile
+    $updated = $Text.Substring(0, $anchor.Index) + $replacement + $Text.Substring($anchor.Index + $anchor.Length)
+    return @{ Text = $updated + $suffix; Status = 'updated' }
+}
 
-    if (($count -eq 0) -and ($intlCount -eq 0) -and ($repairCount -eq 0)) {
-        Write-Host "  hardcoded main-process menu labels already patched" -ForegroundColor Green
+function Patch-SlashCommandMenu {
+    param([string]$ResourcesPath, [string]$Language)
+
+    $assetsDir = Resolve-FrontendAssetsDir $ResourcesPath
+    if (-not $assetsDir) {
+        Write-Host '  [WARNING] Slash command gloss skipped: frontend assets not found' -ForegroundColor DarkYellow
         return
     }
-
-    $patchedContent = [System.Text.Encoding]::UTF8.GetBytes($patched)
-    Replace-AsarFileContent $ResourcesPath $AsarPatchTarget $patchedContent | Out-Null
-    if ($repairCount -gt 0) {
-        Write-Host "  repaired unsafe short main-process menu replacements: $repairCount occurrences" -ForegroundColor Yellow
+    $config = Get-SlashCommandGlossConfig $Language
+    $candidates = @(
+        foreach ($file in (Get-ChildItem (Join-Path $assetsDir '*.js') -File)) {
+            $text = [IO.File]::ReadAllText($file.FullName, [Text.Encoding]::UTF8)
+            if ([regex]::IsMatch($text, $config.Profile.module_pattern)) { @{ File = $file; Text = $text } }
+        }
+    )
+    if ($candidates.Count -ne 1) {
+        Write-Host '  [WARNING] Slash command gloss skipped: expected one menu component' -ForegroundColor DarkYellow
+        return
     }
-    Write-Host "  patched hardcoded main-process menu labels: $($count + $intlCount) replacements" -ForegroundColor Green
+    $candidate = $candidates[0]
+    try { $result = Convert-SlashCommandMenuText $candidate.Text $config.Profile $config.Labels }
+    catch {
+        Write-Host "  [WARNING] Slash command gloss skipped: $($_.Exception.Message)" -ForegroundColor DarkYellow
+        return
+    }
+    if ($result.Status -eq 'already') {
+        Write-Host "  slash command gloss already installed: $($candidate.File.Name)" -ForegroundColor DarkGray
+        return
+    }
+    Backup-ModifiedFile $ResourcesPath $candidate.File.FullName
+    [IO.File]::WriteAllText($candidate.File.FullName, $result.Text, $Utf8NoBom)
+    Write-Host "  patched bilingual slash command menu (${Language}): $($candidate.File.Name)" -ForegroundColor Green
 }
 
 function Set-ClaudeLocale {
@@ -2156,24 +2028,47 @@ function Set-ClaudeLocale {
         }
 
         $config | Add-Member -NotePropertyName "locale" -NotePropertyValue $Locale -Force
-        $config | ConvertTo-Json -Depth 20 | Set-Content $configPath -Encoding UTF8
+        Save-JsonNoBom $configPath $config
         Write-Host "  locale=${Locale}: $configPath" -ForegroundColor Green
     }
 }
 
 function Get-ThirdPartyConfigLibraryPaths {
     $paths = @()
+    $appDataRoots = @()
+    $localAppDataRoots = @()
     if ($env:APPDATA) {
-        $paths += Join-Path $env:APPDATA "Claude-3p\configLibrary"
+        $appDataRoots += $env:APPDATA
+    }
+    if ($env:CLAUDE_ZH_ORIGINAL_APPDATA) {
+        $appDataRoots += $env:CLAUDE_ZH_ORIGINAL_APPDATA
+    }
+    if ($env:LOCALAPPDATA) {
+        $localAppDataRoots += $env:LOCALAPPDATA
+    }
+    if ($env:CLAUDE_ZH_ORIGINAL_LOCALAPPDATA) {
+        $localAppDataRoots += $env:CLAUDE_ZH_ORIGINAL_LOCALAPPDATA
+    }
+    if ($env:CLAUDE_ZH_ORIGINAL_USER_PROFILE) {
+        $appDataRoots += Join-Path $env:CLAUDE_ZH_ORIGINAL_USER_PROFILE "AppData\Roaming"
+        $localAppDataRoots += Join-Path $env:CLAUDE_ZH_ORIGINAL_USER_PROFILE "AppData\Local"
     }
 
-    if ($env:LOCALAPPDATA) {
-        $packageRoot = Join-Path $env:LOCALAPPDATA "Packages"
-        $packageDirs = @(Get-ChildItem (Join-Path $packageRoot "Claude_*") -Directory -ErrorAction SilentlyContinue |
+    foreach ($localAppData in @($localAppDataRoots | Select-Object -Unique)) {
+        $paths += Join-Path $localAppData "Claude-3p\configLibrary"
+    }
+
+    foreach ($localAppData in @($localAppDataRoots | Select-Object -Unique)) {
+        $packageRoot = Join-Path $localAppData "Packages"
+        $packageDirs = @(Get-ChildItem (Join-Path $packageRoot "*Claude_*") -Directory -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending)
         foreach ($packageDir in $packageDirs) {
             $paths += Join-Path $packageDir.FullName "LocalCache\Roaming\Claude-3p\configLibrary"
         }
+    }
+
+    foreach ($appData in @($appDataRoots | Select-Object -Unique)) {
+        $paths += Join-Path $appData "Claude-3p\configLibrary"
     }
 
     return @($paths | Select-Object -Unique)
@@ -2198,6 +2093,38 @@ function Get-JsonObjectOrBackup {
         Copy-Item $Path $backup -Force
         return [pscustomobject]@{}
     }
+}
+
+function Save-JsonNoBom {
+    param(
+        [string]$Path,
+        [object]$Value,
+        [int]$Depth = 20
+    )
+
+    $json = $Value | ConvertTo-Json -Depth $Depth
+    [System.IO.File]::WriteAllText($Path, $json, $Utf8NoBom)
+}
+
+function Test-ThirdPartyApiConfig {
+    param([object]$Config)
+
+    if ($null -eq $Config) {
+        return $false
+    }
+
+    foreach ($name in @(
+        "inferenceGatewayApiKey",
+        "inferenceGatewayBaseUrl",
+        "inferenceGatewayAuthScheme",
+        "inferenceProvider"
+    )) {
+        if (($Config.PSObject.Properties.Name -contains $name) -and ([string]$Config.$name).Trim()) {
+            return $true
+        }
+    }
+
+    return $false
 }
 
 function Add-OrSetJsonProperty {
@@ -2234,60 +2161,51 @@ function Ensure-ConfigLibraryEntry {
     Add-OrSetJsonProperty $Meta "entries" $entries
 }
 
-function Set-ThirdPartyAutoUpdates {
-    param([bool]$Enabled)
-
-    $libraryPaths = @(Get-ThirdPartyConfigLibraryPaths)
-    $existingMetaPaths = @()
-    foreach ($configLibrary in $libraryPaths) {
+function Get-ExistingThirdPartyConfigLibraryPaths {
+    $paths = @()
+    foreach ($configLibrary in @(Get-ThirdPartyConfigLibraryPaths)) {
         $metaPath = Join-Path $configLibrary "_meta.json"
-        if (Test-Path $metaPath -PathType Leaf) {
-            $existingMetaPaths += $configLibrary
+        if (-not (Test-Path $metaPath -PathType Leaf)) {
+            continue
         }
-    }
-
-    if ($existingMetaPaths.Count -gt 0) {
-        $libraryPaths = $existingMetaPaths
-    } else {
-        $existingLibraryPaths = @()
-        foreach ($configLibrary in $libraryPaths) {
-            if (Test-Path $configLibrary -PathType Container) {
-                $existingLibraryPaths += $configLibrary
-            }
-        }
-
-        if ($existingLibraryPaths.Count -gt 0) {
-            $libraryPaths = $existingLibraryPaths
-        } elseif ($env:APPDATA) {
-            $libraryPaths = @(Join-Path $env:APPDATA "Claude-3p\configLibrary")
-        } elseif ($env:LOCALAPPDATA) {
-            $libraryPaths = @(Join-Path $env:LOCALAPPDATA "Claude-3p\configLibrary")
-        } else {
-            Write-Host "  [警告] APPDATA 和 LOCALAPPDATA 均未设置，无法写入 Claude-3p 自动更新配置。" -ForegroundColor DarkYellow
-            return
-        }
-    }
-
-    $updatedCount = 0
-    foreach ($configLibrary in $libraryPaths) {
-        $metaPath = Join-Path $configLibrary "_meta.json"
-        $creatingLibrary = -not (Test-Path $metaPath -PathType Leaf)
 
         $meta = Get-JsonObjectOrBackup $metaPath
         $configId = ""
         if ($meta.PSObject.Properties.Name -contains "appliedId") {
             $configId = ([string]$meta.appliedId).Trim()
         }
-
         if (-not $configId) {
-            $existingConfigs = @(Get-ChildItem $configLibrary -Filter "*.json" -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -ne "_meta.json" } |
-                Sort-Object Name)
-            if ($existingConfigs.Count -gt 0) {
-                $configId = [System.IO.Path]::GetFileNameWithoutExtension($existingConfigs[0].Name)
-            } else {
-                $configId = [guid]::NewGuid().ToString()
+            continue
+        }
+
+        $configPath = Join-Path $configLibrary "$configId.json"
+        if (Test-Path $configPath -PathType Leaf) {
+            $config = Get-JsonObjectOrBackup $configPath
+            if (Test-ThirdPartyApiConfig $config) {
+                $paths += $configLibrary
             }
+        }
+    }
+
+    return @($paths | Select-Object -Unique)
+}
+
+function Set-ThirdPartyConfigAutoUpdates {
+    param([bool]$Enabled)
+
+    $libraryPaths = @(Get-ExistingThirdPartyConfigLibraryPaths)
+    if ($libraryPaths.Count -eq 0) {
+        return $false
+    }
+
+    $updatedCount = 0
+    foreach ($configLibrary in $libraryPaths) {
+        $metaPath = Join-Path $configLibrary "_meta.json"
+
+        $meta = Get-JsonObjectOrBackup $metaPath
+        $configId = ""
+        if ($meta.PSObject.Properties.Name -contains "appliedId") {
+            $configId = ([string]$meta.appliedId).Trim()
         }
 
         $configPath = Join-Path $configLibrary "$configId.json"
@@ -2296,16 +2214,652 @@ function Set-ThirdPartyAutoUpdates {
         Ensure-ConfigLibraryEntry $meta $configId
 
         New-Item -ItemType Directory -Path $configLibrary -Force | Out-Null
-        $config | ConvertTo-Json -Depth 20 | Set-Content $configPath -Encoding UTF8
-        $meta | ConvertTo-Json -Depth 20 | Set-Content $metaPath -Encoding UTF8
+        Save-JsonNoBom $configPath $config
+        Save-JsonNoBom $metaPath $meta
 
         $updatedCount++
+    }
+
+    Write-Host "  已更新 Claude-3p 配置库自动更新设置: $updatedCount 个配置" -ForegroundColor DarkGray
+    return $true
+}
+
+function Get-ClaudePolicyRegistryPath {
+    $sid = [string]$env:CLAUDE_ZH_ORIGINAL_USER_SID
+    if ($sid -and (Test-Path "Registry::HKEY_USERS\$sid")) {
+        return "Registry::HKEY_USERS\$sid\SOFTWARE\Policies\Claude"
+    }
+
+    return "HKCU:\SOFTWARE\Policies\Claude"
+}
+
+function Set-ClaudeManagedAutoUpdates {
+    param([bool]$Enabled)
+
+    $policyPath = Get-ClaudePolicyRegistryPath
+    if ($Enabled) {
+        if (Test-Path $policyPath) {
+            Remove-ItemProperty -Path $policyPath -Name "disableAutoUpdates" -ErrorAction SilentlyContinue
+        }
+        Write-Host "  已移除 Claude Desktop 自动更新禁用策略: $policyPath" -ForegroundColor DarkGray
+    } else {
+        New-Item -Path $policyPath -Force | Out-Null
+        New-ItemProperty -Path $policyPath -Name "disableAutoUpdates" -Value 1 -PropertyType DWord -Force | Out-Null
+        Write-Host "  已写入 Claude Desktop 自动更新禁用策略: $policyPath" -ForegroundColor DarkGray
+    }
+}
+
+function Set-ClaudeAutoUpdates {
+    param([bool]$Enabled)
+
+    if (-not (Set-ThirdPartyConfigAutoUpdates $Enabled)) {
+        Set-ClaudeManagedAutoUpdates $Enabled
     }
 
     if ($Enabled) {
         Write-Host "允许更新成功" -ForegroundColor Green
     } else {
         Write-Host "禁止更新成功" -ForegroundColor Green
+    }
+}
+
+function Get-ClaudeAppUserModelId {
+    param([string]$ShortcutPath)
+
+    # 优先从原快捷方式字节中提取 AUMID，如 Claude_pzs8sxrjxfjjc!Claude
+    if (Test-Path -LiteralPath $ShortcutPath) {
+        try {
+            $data = [System.IO.File]::ReadAllBytes($ShortcutPath)
+            $text = [System.Text.Encoding]::Unicode.GetString($data)
+            $match = [regex]::Match($text, '(?:[A-Za-z0-9]+\.)*Claude_[A-Za-z0-9]+![A-Za-z0-9]+')
+            if ($match.Success) {
+                return $match.Value
+            }
+        } catch {
+        }
+    }
+
+    # 回退：从 AppX 包推导 PackageFamilyName + AppId
+    try {
+        $package = Get-ClaudeAppxPackages | Select-Object -First 1
+        if ($package) {
+            $manifest = Join-Path $package.InstallLocation "AppxManifest.xml"
+            $appId = "Claude"
+            if (Test-Path -LiteralPath $manifest) {
+                try {
+                    $xml = New-Object System.Xml.XmlDocument
+                    $xml.Load($manifest)
+                    $ns = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
+                    $ns.AddNamespace("d", "http://schemas.microsoft.com/appx/manifest/foundation/windows10")
+                    $appNode = $xml.SelectSingleNode("//d:Application", $ns)
+                    if ($appNode -and $appNode.Id) {
+                        $appId = [string]$appNode.Id
+                    }
+                } catch {
+                }
+            }
+            return "$($package.PackageFamilyName)!$appId"
+        }
+    } catch {
+    }
+
+    return ""
+}
+
+function Rebuild-ClaudeDesktopShortcut {
+    param(
+        [string]$ShortcutPath,
+        [string]$ClaudePath
+    )
+
+    $aumid = Get-ClaudeAppUserModelId $ShortcutPath
+    if (-not $aumid) {
+        Write-Host "  [警告] 无法确定 AppUserModelID，跳过快捷方式重建: $ShortcutPath" -ForegroundColor Yellow
+        return $false
+    }
+
+    $backup = "$ShortcutPath.broken.bak"
+    if (-not (Test-Path -LiteralPath $backup)) {
+        Copy-Item -LiteralPath $ShortcutPath $backup -Force
+        Write-Host "  已备份原快捷方式: $backup" -ForegroundColor DarkGray
+    }
+
+    try {
+        $iconCandidates = @(
+            (Join-Path $ClaudePath "Assets\Square44x44Logo.png"),
+            (Join-Path $ClaudePath "Assets\Square150x150Logo.png"),
+            (Join-Path $ClaudePath "Assets\icon.png"),
+            (Join-Path $ClaudePath "app\claude.exe")
+        )
+        $iconLocation = ""
+        foreach ($candidate in $iconCandidates) {
+            if (Test-Path -LiteralPath $candidate) {
+                $iconLocation = $candidate
+                break
+            }
+        }
+
+        $ws = New-Object -ComObject WScript.Shell
+        $shellShortcut = $ws.CreateShortcut($ShortcutPath)
+        $shellShortcut.TargetPath = (Join-Path $env:WINDIR "explorer.exe")
+        $shellShortcut.Arguments = "shell:AppsFolder\$aumid"
+        $shellShortcut.WorkingDirectory = $env:WINDIR
+        $shellShortcut.Description = "Claude Desktop"
+        if ($iconLocation) {
+            $shellShortcut.IconLocation = $iconLocation
+        }
+        $shellShortcut.Save()
+
+        Write-Host "  [重建] 快捷方式已按当前版本重建，AUMID: $aumid" -ForegroundColor Green
+        return $true
+    }
+    catch {
+        Write-Host "  [警告] 快捷方式重建失败: $ShortcutPath - $($_.Exception.Message)" -ForegroundColor Yellow
+        return $false
+    }
+}
+
+function Repair-ClaudeDesktopShortcut {
+    param([string]$ClaudePath)
+
+    if (-not $ClaudePath) {
+        return
+    }
+
+    # 从安装路径提取当前 AppX 版本号，如 Claude_1.40609.0.0_x64__pzs8sxrjxfjjc
+    $currentVersion = ""
+    if ($ClaudePath -match 'Claude_(\d+\.\d+\.\d+\.\d+)_') {
+        $currentVersion = $Matches[1]
+    }
+    if (-not $currentVersion) {
+        Write-Host "  [跳过] 无法从安装路径识别版本号: $ClaudePath" -ForegroundColor DarkYellow
+        return
+    }
+
+    # 查找桌面（用户桌面 + 公共桌面）上的 Claude 快捷方式
+    $shortcutPaths = @()
+    foreach ($folderName in @("Desktop", "CommonDesktopDirectory")) {
+        $folder = [Environment]::GetFolderPath($folderName)
+        if ($folder -and (Test-Path -LiteralPath $folder)) {
+            $shortcutPaths += @(Get-ChildItem -LiteralPath $folder -Filter "Claude*.lnk" -Force -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.FullName })
+        }
+    }
+    $shortcutPaths = @($shortcutPaths | Where-Object { $_ } | Select-Object -Unique)
+    if ($shortcutPaths.Count -eq 0) {
+        Write-Host "  未找到桌面 Claude 快捷方式，跳过修复。" -ForegroundColor DarkGray
+        return
+    }
+
+    $needleUtf16 = [System.Text.Encoding]::Unicode.GetBytes("Claude_")
+    $needleAscii = [System.Text.Encoding]::ASCII.GetBytes("Claude_")
+    $newVersionUtf16 = [System.Text.Encoding]::Unicode.GetBytes($currentVersion)
+    $newVersionAscii = [System.Text.Encoding]::ASCII.GetBytes($currentVersion)
+
+    foreach ($shortcutPath in $shortcutPaths) {
+        try {
+            $data = [System.IO.File]::ReadAllBytes($shortcutPath)
+        } catch {
+            Write-Host "  [警告] 无法读取快捷方式: $shortcutPath" -ForegroundColor DarkYellow
+            continue
+        }
+
+        # 第一遍：找出所有版本号，判断是否有不等长（需要整文件重建）
+        $needsRebuild = $false
+        $versionRefs = [System.Collections.Generic.List[object]]::new()
+        foreach ($mode in @('utf16', 'ascii')) {
+            $needle = if ($mode -eq 'utf16') { $needleUtf16 } else { $needleAscii }
+            foreach ($index in Find-BytePattern $data $needle) {
+                $verStart = $index + $needle.Length
+                $chars = New-Object System.Collections.Generic.List[char]
+                $pos = $verStart
+                if ($mode -eq 'utf16') {
+                    while (($pos + 1) -lt $data.Length -and $data[$pos + 1] -eq 0 -and
+                        ((($data[$pos] -ge 0x30) -and ($data[$pos] -le 0x39)) -or ($data[$pos] -eq 0x2E))) {
+                        $chars.Add([char]$data[$pos])
+                        $pos += 2
+                    }
+                } else {
+                    while ($pos -lt $data.Length -and
+                        ((($data[$pos] -ge 0x30) -and ($data[$pos] -le 0x39)) -or ($data[$pos] -eq 0x2E))) {
+                        $chars.Add([char]$data[$pos])
+                        $pos += 1
+                    }
+                }
+                $oldVersion = -join $chars
+                if (($oldVersion -notmatch '^\d+\.\d+\.\d+\.\d+$') -or ($oldVersion -eq $currentVersion)) {
+                    continue
+                }
+                $versionRefs.Add([pscustomobject]@{
+                    Mode = $mode
+                    Offset = $verStart
+                    OldVersion = $oldVersion
+                })
+                if ($oldVersion.Length -ne $currentVersion.Length) {
+                    $needsRebuild = $true
+                }
+            }
+        }
+
+        if ($versionRefs.Count -eq 0) {
+            Write-Host "  快捷方式版本已是最新: $shortcutPath" -ForegroundColor DarkGray
+            continue
+        }
+
+        # 等长：原地字节替换，保留 .lnk 原始结构
+        if (-not $needsRebuild) {
+            $repaired = $false
+            foreach ($ref in $versionRefs) {
+                if ($ref.Mode -eq 'utf16') {
+                    [System.Array]::Copy($newVersionUtf16, 0, $data, [int]$ref.Offset, $newVersionUtf16.Length)
+                } else {
+                    [System.Array]::Copy($newVersionAscii, 0, $data, [int]$ref.Offset, $newVersionAscii.Length)
+                }
+                Write-Host "  快捷方式版本号: $($ref.OldVersion) -> $currentVersion" -ForegroundColor Green
+                $repaired = $true
+            }
+            if ($repaired) {
+                $backup = "$shortcutPath.broken.bak"
+                if (-not (Test-Path -LiteralPath $backup)) {
+                    Copy-Item -LiteralPath $shortcutPath $backup -Force
+                    Write-Host "  已备份原快捷方式: $backup" -ForegroundColor DarkGray
+                }
+                [System.IO.File]::WriteAllBytes($shortcutPath, $data)
+                Write-Host "  已更新快捷方式: $shortcutPath" -ForegroundColor Green
+            }
+            continue
+        }
+
+        # 版本号长度不一致：.lnk 是二进制结构，直接增删字节会破坏文件，改为整文件重建
+        Write-Host "  [重建] $shortcutPath 内版本号长度不一致（$($(($versionRefs | ForEach-Object { $_.OldVersion }) -join ', '))），改为按当前版本重建快捷方式..." -ForegroundColor Yellow
+        [void](Rebuild-ClaudeDesktopShortcut $shortcutPath $ClaudePath)
+    }
+}
+
+function Start-CoworkVMService {
+    $serviceName = "CoworkVMService"
+    $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+    if (-not $service) {
+        Write-Host "  [提示] 未找到 $serviceName 服务，跳过。" -ForegroundColor DarkGray
+        return
+    }
+
+    if ($service.Status -eq "Running") {
+        Write-Host "  $serviceName 已在运行" -ForegroundColor Green
+        return
+    }
+
+    try {
+        Start-Service -Name $serviceName -ErrorAction Stop
+        Start-Sleep -Seconds 2
+        $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        Write-Host "  $serviceName 已启动，当前状态: $($service.Status)" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "  [警告] 启动 $serviceName 失败: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
+function Get-CCSwitchSkillsDirectory {
+    $userProfile = $env:USERPROFILE
+    if (-not $userProfile) {
+        $userProfile = [Environment]::GetFolderPath("UserProfile")
+    }
+    if (-not $userProfile) {
+        throw "无法确定当前用户目录，无法定位 CC Switch skills。"
+    }
+
+    return Join-Path $userProfile ".cc-switch\skills"
+}
+
+function Get-ClaudeSkillsPluginBasePaths {
+    $paths = @()
+    if ($env:LOCALAPPDATA) {
+        $paths += Join-Path $env:LOCALAPPDATA "Claude-3p\local-agent-mode-sessions\skills-plugin"
+    }
+    if ($env:APPDATA) {
+        $paths += Join-Path $env:APPDATA "Claude-3p\local-agent-mode-sessions\skills-plugin"
+    }
+
+    return @($paths | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Find-ClaudeDesktopSkillsPluginRoot {
+    $candidates = @()
+    foreach ($base in Get-ClaudeSkillsPluginBasePaths) {
+        if (-not (Test-Path -LiteralPath $base -PathType Container)) {
+            continue
+        }
+
+        foreach ($orgDir in Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue) {
+            foreach ($pluginDir in Get-ChildItem -LiteralPath $orgDir.FullName -Directory -ErrorAction SilentlyContinue) {
+                $manifestPath = Join-Path $pluginDir.FullName "manifest.json"
+                $skillsDir = Join-Path $pluginDir.FullName "skills"
+                if ((Test-Path -LiteralPath $manifestPath -PathType Leaf) -and (Test-Path -LiteralPath $skillsDir -PathType Container)) {
+                    $manifest = Get-Item -LiteralPath $manifestPath
+                    $candidates += [pscustomobject]@{
+                        Path = $pluginDir.FullName
+                        ManifestLastWriteTime = $manifest.LastWriteTimeUtc
+                    }
+                }
+            }
+        }
+    }
+
+    if ($candidates.Count -eq 0) {
+        $searched = (Get-ClaudeSkillsPluginBasePaths) -join "; "
+        throw "未找到 Claude Desktop skills plugin 目录。已搜索: $searched"
+    }
+
+    return ($candidates | Sort-Object ManifestLastWriteTime -Descending | Select-Object -First 1).Path
+}
+
+function Read-SkillFrontmatter {
+    param([string]$SkillMdPath)
+
+    $text = Get-Content $SkillMdPath -Raw -Encoding UTF8
+    $lines = $text -split "`r?`n"
+    if ($lines.Count -eq 0 -or $lines[0].Trim() -ne "---") {
+        return @{}
+    }
+
+    $end = -1
+    for ($i = 1; $i -lt $lines.Count; $i++) {
+        if ($lines[$i].Trim() -eq "---") {
+            $end = $i
+            break
+        }
+    }
+    if ($end -lt 0) {
+        return @{}
+    }
+
+    $data = @{}
+    $key = ""
+    $valueLines = @()
+    $flushFrontmatterValue = {
+        if ($key) {
+            $data[$key] = (($valueLines | ForEach-Object { $_.Trim() }) -join "`n").Trim()
+        }
+        $key = ""
+        $valueLines = @()
+    }
+
+    for ($i = 1; $i -lt $end; $i++) {
+        $line = $lines[$i]
+        if (-not $line.Trim()) {
+            if ($key -and $valueLines.Count -gt 0) {
+                $valueLines += ""
+            }
+            continue
+        }
+
+        if ($line -match '^\s') {
+            if ($key) {
+                $valueLines += $line.Trim()
+            }
+            continue
+        }
+
+        $match = [regex]::Match($line, '^([A-Za-z0-9_-]+):(?:\s*(.*))?$')
+        if (-not $match.Success) {
+            continue
+        }
+
+        . $flushFrontmatterValue
+        $key = $match.Groups[1].Value
+        $value = $match.Groups[2].Value.Trim()
+        if ($value) {
+            $valueLines = @($value)
+        } else {
+            $valueLines = @()
+        }
+    }
+    . $flushFrontmatterValue
+
+    return $data
+}
+
+function Get-CCSwitchSkills {
+    param([string]$SkillsDirectory)
+
+    if (-not (Test-Path -LiteralPath $SkillsDirectory -PathType Container)) {
+        throw "CC Switch skills 目录不存在: $SkillsDirectory"
+    }
+
+    $skills = @()
+    foreach ($dir in Get-ChildItem -LiteralPath $SkillsDirectory -Directory -ErrorAction SilentlyContinue | Sort-Object Name) {
+        $skillMd = Join-Path $dir.FullName "SKILL.md"
+        if (-not (Test-Path -LiteralPath $skillMd -PathType Leaf)) {
+            continue
+        }
+
+        $frontmatter = Read-SkillFrontmatter $skillMd
+        $name = ""
+        if ($frontmatter.ContainsKey("name")) {
+            $name = ([string]$frontmatter["name"]).Trim()
+        }
+        if (-not $name) {
+            $name = $dir.Name
+        }
+        if (-not $name -or $name -eq "." -or $name -eq ".." -or $name.Contains("/") -or $name.Contains("\")) {
+            Write-Host "  [跳过] skill 名称无效: $name" -ForegroundColor DarkYellow
+            continue
+        }
+
+        $description = ""
+        if ($frontmatter.ContainsKey("description")) {
+            $description = ([string]$frontmatter["description"]).Trim()
+        }
+
+        $skills += [pscustomobject]@{
+            Name = $name
+            Description = $description
+            Path = $dir.FullName
+        }
+    }
+
+    return $skills
+}
+
+function Ensure-SkillsManifestList {
+    param([pscustomobject]$Manifest)
+
+    if (-not ($Manifest.PSObject.Properties.Name -contains "skills") -or $null -eq $Manifest.skills -or ($Manifest.skills -is [string])) {
+        Add-OrSetJsonProperty $Manifest "skills" @()
+    }
+}
+
+function Get-ReparsePointTarget {
+    param([string]$Path)
+
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if (-not (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint)) {
+            return ""
+        }
+
+        if ($item.PSObject.Properties.Name -contains "Target" -and $item.Target) {
+            if ($item.Target -is [array]) {
+                return [string]$item.Target[0]
+            }
+            return [string]$item.Target
+        }
+        if ($item.PSObject.Properties.Name -contains "LinkTarget" -and $item.LinkTarget) {
+            return [string]$item.LinkTarget
+        }
+    }
+    catch {
+        return ""
+    }
+
+    return ""
+}
+
+function Resolve-ExistingPath {
+    param([string]$Path)
+
+    try {
+        return [System.IO.Path]::GetFullPath($Path)
+    }
+    catch {
+        return ""
+    }
+}
+
+function Test-PathWithinDirectory {
+    param(
+        [string]$Path,
+        [string]$Parent
+    )
+
+    $fullPath = Resolve-ExistingPath $Path
+    $fullParent = Resolve-ExistingPath $Parent
+    if (-not $fullPath -or -not $fullParent) {
+        return $false
+    }
+
+    $fullParent = $fullParent.TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    return $fullPath.Equals($fullParent, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $fullPath.StartsWith($fullParent + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $fullPath.StartsWith($fullParent + [System.IO.Path]::AltDirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Remove-ReparsePoint {
+    param([string]$Path)
+
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (($item.Attributes -band [System.IO.FileAttributes]::Directory) -eq [System.IO.FileAttributes]::Directory) {
+        [System.IO.Directory]::Delete($Path, $false)
+    } else {
+        [System.IO.File]::Delete($Path)
+    }
+}
+
+function Sync-CCSwitchSkills {
+    $skillsDirectory = Get-CCSwitchSkillsDirectory
+    $pluginRoot = Find-ClaudeDesktopSkillsPluginRoot
+    $desktopSkillsDirectory = Join-Path $pluginRoot "skills"
+    $manifestPath = Join-Path $pluginRoot "manifest.json"
+    $manifest = Get-JsonObjectOrBackup $manifestPath
+    Ensure-SkillsManifestList $manifest
+
+    $manifestSkills = @($manifest.skills)
+    $existingNames = @{}
+    foreach ($item in $manifestSkills) {
+        if ($item -is [pscustomobject] -and $item.PSObject.Properties.Name -contains "name" -and [string]$item.name) {
+            $existingNames[[string]$item.name] = $true
+        }
+    }
+
+    $ccSkills = @(Get-CCSwitchSkills $skillsDirectory)
+    $now = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+    $linked = 0
+    $manifestAdded = 0
+    $skipped = 0
+
+    Write-Host "Claude Desktop skills plugin: $pluginRoot"
+    Write-Host "CC Switch skills source: $skillsDirectory"
+
+    foreach ($skill in $ccSkills) {
+        $target = Join-Path $desktopSkillsDirectory $skill.Name
+        if ((Test-Path -LiteralPath $target) -or $existingNames.ContainsKey($skill.Name)) {
+            Write-Host "  同名 skill 已存在，跳过: $($skill.Name)" -ForegroundColor DarkYellow
+            $skipped++
+            continue
+        }
+
+        New-Item -ItemType SymbolicLink -Path $target -Target $skill.Path | Out-Null
+        $linked++
+        Write-Host "  同步软链接: $($skill.Name) -> $($skill.Path)" -ForegroundColor Green
+
+        $manifestItem = [pscustomobject][ordered]@{
+            skillId = $skill.Name
+            name = $skill.Name
+            description = $skill.Description
+            creatorType = "user"
+            syncManaged = $false
+            updatedAt = $now
+            enabled = $true
+        }
+        $manifestSkills += $manifestItem
+        $existingNames[$skill.Name] = $true
+        $manifestAdded++
+        Write-Host "  写入 manifest: $($skill.Name)" -ForegroundColor Green
+    }
+
+    if ($manifestAdded -gt 0) {
+        Add-OrSetJsonProperty $manifest "skills" $manifestSkills
+        Add-OrSetJsonProperty $manifest "lastUpdated" ([Int64]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()))
+        $backup = Join-Path $pluginRoot "manifest.json.bak-before-cc-switch-sync"
+        Copy-Item $manifestPath $backup -Force
+        Save-JsonNoBom $manifestPath $manifest
+    }
+
+    Write-Host "同步完成：新增软链接 $linked 个，新增 manifest $manifestAdded 条，跳过 $skipped 个。" -ForegroundColor Green
+}
+
+function Unsync-CCSwitchSkills {
+    $skillsDirectory = Get-CCSwitchSkillsDirectory
+    $pluginRoot = Find-ClaudeDesktopSkillsPluginRoot
+    $desktopSkillsDirectory = Join-Path $pluginRoot "skills"
+    $manifestPath = Join-Path $pluginRoot "manifest.json"
+    $manifest = Get-JsonObjectOrBackup $manifestPath
+    Ensure-SkillsManifestList $manifest
+    $removedNames = @{}
+    $skipped = 0
+
+    Write-Host "Claude Desktop skills plugin: $pluginRoot"
+    Write-Host "CC Switch skills source: $skillsDirectory"
+
+    foreach ($targetItem in Get-ChildItem -LiteralPath $desktopSkillsDirectory -Force -ErrorAction SilentlyContinue) {
+        $target = $targetItem.FullName
+        $targetItem = Get-Item -LiteralPath $target -Force
+        if (-not (($targetItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint)) {
+            Write-Host "  不是 CC Switch 同步软链接，跳过: $($targetItem.Name)" -ForegroundColor DarkYellow
+            $skipped++
+            continue
+        }
+
+        $linkTarget = Get-ReparsePointTarget $target
+        if (-not $linkTarget) {
+            Write-Host "  无法解析软链接目标，跳过: $target" -ForegroundColor DarkYellow
+            $skipped++
+            continue
+        }
+        if (-not [System.IO.Path]::IsPathRooted($linkTarget)) {
+            $linkTarget = Join-Path $desktopSkillsDirectory $linkTarget
+        }
+        $resolvedTarget = Resolve-ExistingPath $linkTarget
+        if (-not (Test-PathWithinDirectory $resolvedTarget $skillsDirectory)) {
+            Write-Host "  软链接目标不在 CC Switch skills 目录内，跳过: $($targetItem.Name)" -ForegroundColor DarkYellow
+            $skipped++
+            continue
+        }
+
+        Remove-ReparsePoint $target
+        $removedNames[$targetItem.Name] = $true
+        Write-Host "  删除同步: $($targetItem.Name) -> $resolvedTarget" -ForegroundColor Green
+    }
+
+    if ($removedNames.Count -gt 0) {
+        $oldManifestSkills = @($manifest.skills)
+        $keptSkills = @()
+        foreach ($item in $oldManifestSkills) {
+            if ($item -is [pscustomobject] -and $item.PSObject.Properties.Name -contains "name" -and $removedNames.ContainsKey([string]$item.name)) {
+                continue
+            }
+            $keptSkills += $item
+        }
+        $removedManifestCount = $oldManifestSkills.Count - $keptSkills.Count
+        Add-OrSetJsonProperty $manifest "skills" $keptSkills
+        Add-OrSetJsonProperty $manifest "lastUpdated" ([Int64]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()))
+        $backup = Join-Path $pluginRoot "manifest.json.bak-before-cc-switch-sync"
+        Copy-Item $manifestPath $backup -Force
+        Save-JsonNoBom $manifestPath $manifest
+        Write-Host "取消同步完成：删除 $($removedNames.Count) 个软链接，删除 $removedManifestCount 条 manifest 记录，跳过 $skipped 个。" -ForegroundColor Green
+    } else {
+        Write-Host "取消同步完成：删除 0 个，跳过 $skipped 个。" -ForegroundColor Green
     }
 }
 
@@ -2316,27 +2870,158 @@ function Remove-LanguageFiles {
         (Join-Path $ResourcesPath "ion-dist\i18n\zh-CN.json"),
         (Join-Path $ResourcesPath "zh-CN.json"),
         (Join-Path $ResourcesPath "ion-dist\i18n\statsig\zh-CN.json"),
+        (Join-Path $ResourcesPath "ion-dist\i18n\dynamic\zh-CN.json"),
         (Join-Path $ResourcesPath "ion-dist\i18n\zh-TW.json"),
         (Join-Path $ResourcesPath "zh-TW.json"),
         (Join-Path $ResourcesPath "ion-dist\i18n\statsig\zh-TW.json"),
+        (Join-Path $ResourcesPath "ion-dist\i18n\dynamic\zh-TW.json"),
         (Join-Path $ResourcesPath "ion-dist\i18n\zh-HK.json"),
         (Join-Path $ResourcesPath "zh-HK.json"),
-        (Join-Path $ResourcesPath "ion-dist\i18n\statsig\zh-HK.json")
+        (Join-Path $ResourcesPath "ion-dist\i18n\statsig\zh-HK.json"),
+        (Join-Path $ResourcesPath "ion-dist\i18n\dynamic\zh-HK.json")
     )
 
     foreach ($target in $targets) {
         Remove-Item $target -Force -ErrorAction SilentlyContinue
-        if (Test-Path $target) {
+        if (-not (Test-Path $target)) {
             Write-Host "  removed: $target" -ForegroundColor Green
+        } else {
+            Write-Host "  [警告] 未能删除: $target" -ForegroundColor DarkYellow
         }
     }
 }
 
+function Test-ClaudeDesktopProcessPath {
+    param([string]$Path)
+
+    if (-not $Path) {
+        return $false
+    }
+    return ($Path -match "WindowsApps\\Claude_" -or $Path -match "AnthropicClaude\\app-")
+}
+
+function Get-ClaudeDesktopProcesses {
+    $procs = @()
+    foreach ($proc in Get-Process -Name "claude" -ErrorAction SilentlyContinue) {
+        try {
+            $path = $proc.MainModule.FileName
+            if (Test-ClaudeDesktopProcessPath $path) {
+                $procs += $proc
+            }
+        } catch {
+            # MainModule inaccessible (permission or 32/64 mismatch) — skip rather than risk killing Claude Code.
+        }
+    }
+    return @($procs | Sort-Object Id -Unique)
+}
+
+function Get-ClaudeCoworkProcesses {
+    $items = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -ieq "cowork-svc.exe" -and (Test-ClaudeDesktopProcessPath $_.ExecutablePath)
+        })
+
+    $procs = @()
+    foreach ($item in $items) {
+        $proc = Get-Process -Id $item.ProcessId -ErrorAction SilentlyContinue
+        if ($proc) {
+            $procs += $proc
+        }
+    }
+    return @($procs | Sort-Object Id -Unique)
+}
+
+function Wait-ProcessesExit {
+    param(
+        [object[]]$Processes,
+        [int]$TimeoutSeconds = 10
+    )
+
+    $remaining = @($Processes)
+    $elapsed = 0
+    while ($elapsed -lt $TimeoutSeconds) {
+        if ($remaining.Count -eq 0) {
+            return @()
+        }
+        Start-Sleep -Seconds 1
+        $elapsed++
+        $remaining = @($remaining | Where-Object {
+            try { -not $_.HasExited } catch { $false }
+        })
+    }
+    return @($remaining)
+}
+
+function Stop-ClaudeProcessesGracefully {
+    param(
+        [int]$TimeoutSeconds = 10
+    )
+
+    $desktopProcs = @(Get-ClaudeDesktopProcesses)
+    $coworkProcs = @(Get-ClaudeCoworkProcesses)
+    if (($desktopProcs.Count + $coworkProcs.Count) -eq 0) {
+        return $true
+    }
+
+    foreach ($proc in $desktopProcs) {
+        Write-Host "  正在请求 Claude Desktop 优雅退出 (PID $($proc.Id))..." -ForegroundColor DarkGray
+        try {
+            if ($proc.MainWindowHandle -ne 0) {
+                [void]$proc.CloseMainWindow()
+            } else {
+                $null = & taskkill /PID $proc.Id 2>&1
+            }
+        } catch {
+            # 继续等待，必要时只终止 Claude Desktop 自身，不终止进程树。
+        }
+    }
+
+    $remainingDesktop = @(Wait-ProcessesExit $desktopProcs $TimeoutSeconds)
+    if ($remainingDesktop.Count -gt 0) {
+        Write-Host "  Claude Desktop 优雅退出超时（${TimeoutSeconds}秒），仅强制终止 Desktop 主进程..." -ForegroundColor DarkYellow
+        foreach ($proc in $remainingDesktop) {
+            try {
+                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            } catch {
+                # 已退出或无法终止
+            }
+        }
+        Start-Sleep -Seconds 1
+    }
+
+    # cowork-svc.exe 不叫 claude.exe，旧逻辑不会停它；恢复/覆盖 app.asar 时它可能继续占用资源。
+    $coworkProcs = @(Get-ClaudeCoworkProcesses)
+    if ($coworkProcs.Count -gt 0) {
+        foreach ($proc in $coworkProcs) {
+            Write-Host "  正在停止 Claude Cowork 服务进程 (PID $($proc.Id))..." -ForegroundColor DarkGray
+            try {
+                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            } catch {
+                # 已退出或权限不足
+            }
+        }
+        $remainingCowork = @(Wait-ProcessesExit $coworkProcs 5)
+        foreach ($proc in $remainingCowork) {
+            Write-Host "  [警告] 未能停止 Cowork 进程 PID $($proc.Id)，可能需要管理员权限或手动结束。" -ForegroundColor DarkYellow
+        }
+    }
+
+    $stillDesktop = @(Get-ClaudeDesktopProcesses)
+    $stillCowork = @(Get-ClaudeCoworkProcesses)
+    if (($stillDesktop.Count + $stillCowork.Count) -eq 0) {
+        Write-Host "  Claude Desktop/Cowork 已停止" -ForegroundColor Green
+        return $true
+    }
+    return $false
+}
+
 function Stop-ClaudeProcesses {
-    Stop-Process -Name "Claude" -Force -ErrorAction SilentlyContinue
-    Stop-Process -Name "claude" -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
-    Write-Host "  stopped Claude Desktop if it was running" -ForegroundColor Green
+    $killed = Stop-ClaudeProcessesGracefully -TimeoutSeconds 10
+    if ($killed) {
+        Write-Host "  Claude Desktop 已停止" -ForegroundColor Green
+    } else {
+        Write-Host "  已强制停止 Claude Desktop" -ForegroundColor Green
+    }
 }
 
 function Restart-Claude {
@@ -2344,10 +3029,25 @@ function Restart-Claude {
 
     Stop-ClaudeProcesses
 
+    # AppX(MSIX) 安装优先用包激活启动: 进程带包身份, 更新检查走 msix 路径
+    # (直接启动 exe 会被更新器误判为 Squirrel 解包安装而报 "Can not find Squirrel",
+    #  Cowork 客户端校验也只能靠签名回退)
+    try {
+        $app = Get-StartApps -ErrorAction Stop | Where-Object { $_.AppID -like "*Claude_*!*" } | Select-Object -First 1
+        if ($app -and $app.AppID) {
+            Start-Process -FilePath "explorer.exe" -ArgumentList "shell:AppsFolder\$($app.AppID)"
+            Write-Host "  已通过 AppX 激活重启 Claude Desktop ($($app.AppID))" -ForegroundColor Green
+            return
+        }
+    } catch {
+        Write-Host "  [提示] AppX 激活不可用($($_.Exception.Message))，改用直接启动。" -ForegroundColor DarkYellow
+    }
+
     $exe = Get-ClaudeExePath $ClaudePath
     if ($exe) {
-        Start-Process $exe
+        Start-Process -FilePath "explorer.exe" -ArgumentList "`"$exe`""
         Write-Host "  restarted Claude Desktop" -ForegroundColor Green
+        Write-Host "  [提示] MSIX 安装建议从开始菜单启动 Claude，以获得完整功能(自动更新/Cowork)。" -ForegroundColor DarkYellow
         return
     }
 
@@ -2356,101 +3056,121 @@ function Restart-Claude {
 
 function Install-WindowsLanguagePack {
     $label = Get-LanguageLabel $LanguageCode
+
+    # 单实例互斥锁：防止多个安装进程并发写入 Claude 资源
+    $mutex = New-Object System.Threading.Mutex($false, "Global\ClaudeDesktopZhCn-Installer")
+    try {
+        if (-not $mutex.WaitOne(0)) {
+            Write-Host "  [错误] 另一个安装进程正在运行，请等待其完成后再试。" -ForegroundColor Red
+            return
+        }
+    } catch [System.Threading.AbandonedMutexException] {
+        # 上一个进程异常退出，锁已释放，继续执行
+    }
+
     Write-Host "=== Claude Desktop Windows $label 补丁 ===" -ForegroundColor Cyan
 
+    $patchTarget = $null
     try {
-        Write-Step "[1/9] 检查安装模式"
-        if ($PatchMode -eq "safe") {
-            Write-Host "  Cowork 兼容模式：无需第三方 API 配置检查。" -ForegroundColor Green
-        } elseif ($PatchMode -eq "official") {
-            Write-Host "  官方账号登录模式：无需第三方 API 配置检查。" -ForegroundColor Green
-        } else {
-            Write-Host "  第三方 API 登录模式：无需第三方 API 配置检查。" -ForegroundColor Green
-        }
-
-        Write-Step "[2/9] 检查语言资源"
+        Write-Step "[1/7] 检查语言资源"
         $pack = Get-LanguageResources $LanguageCode
 
         Write-Step "关闭 Claude Desktop"
         Stop-ClaudeProcesses
 
-        Write-Step "[3/9] 查找 Claude Desktop"
+        Write-Step "[2/7] 查找 Claude Desktop"
         $paths = Get-ClaudeResourcesPath
         $claudePath = $paths["App"]
         $resourcesPath = $paths["Resources"]
         $installKind = $paths["InstallKind"]
         Write-Host "  app: $claudePath" -ForegroundColor Green
         Write-Host "  resources: $resourcesPath" -ForegroundColor Green
+        if ($installKind -eq "AppX") {
+            Write-Host "  安装类型: 商店版 (MSIX/AppX)" -ForegroundColor DarkGray
+        }
 
-        Write-Step "[4/9] 准备写入权限"
+        Write-Step "修复桌面 Claude 快捷方式"
+        Repair-ClaudeDesktopShortcut $claudePath
+
+        Write-Step "[3/7] 准备写入权限"
         Enable-WriteAccess $resourcesPath
         Remove-LegacyAppxForkArtifacts
+        $patchTarget = Initialize-FrontendPatchTarget $resourcesPath
 
-        Write-Step "[5/9] 写入 $label 资源"
+        Write-Step "[4/7] 写入 $label 资源"
         Install-LanguageFiles $resourcesPath $pack $LanguageCode
 
-        Write-Step "[6/9] 注册中文语言"
+        Write-Step "[5/7] 注册中文语言"
         Register-Language $resourcesPath $LanguageCode
 
-        Write-Step "[7/9] 汉化硬编码界面文本"
+        Write-Step "[6/7] 汉化硬编码界面文本"
         Patch-HardcodedFrontendStrings $resourcesPath $LanguageCode
+        Patch-SlashCommandMenu $resourcesPath $LanguageCode
         Patch-LanguageDisplayNames $resourcesPath
-        if (Test-OnlineAccountPatchEnabled) {
-            Write-AsarCoworkSignatureWarning
-            Patch-OnlineDomTranslation $resourcesPath $pack $LanguageCode
-            Patch-HardcodedMainProcessMenuLabels $resourcesPath $LanguageCode
-        } else {
-            Write-Host "  skipping online claude.ai DOM translation patch (app.asar) due to patch mode: $PatchMode" -ForegroundColor DarkYellow
-            Write-Host "  skipping main-process menu label patch (app.asar) due to patch mode: $PatchMode" -ForegroundColor DarkYellow
-        }
+        Complete-FrontendPatchTarget $patchTarget
+        Close-FrontendPatchTarget $patchTarget
+        $usedAsarFrontend = $patchTarget.Mode -eq "Asar"
+        $patchTarget = $null
 
-        Write-Step "[8/9] 修复第三方模型名校验"
-        if (Test-Custom3PPatchEnabled) {
-            Patch-Custom3PModelValidation $resourcesPath
-            Patch-CoworkModernInstallerCheck $resourcesPath
-        } else {
-            Write-Host "  skipping 3P model validation patch (app.asar) due to patch mode: $PatchMode" -ForegroundColor DarkYellow
-        }
-
-        if (-not (Test-AsarPatchEnabled)) {
-            Write-Host "  skipping Claude.exe asar integrity sync due to patch mode: $PatchMode" -ForegroundColor DarkYellow
-        }
-
-        Write-Step "[9/9] 写入用户语言配置"
+        Write-Step "[7/7] 写入用户语言配置"
         Set-ClaudeLocale $LanguageCode
+
         Write-Step "重启 Claude Desktop"
         Restart-Claude $claudePath
 
+        Write-Step "启动 CoworkVMService"
+        Start-CoworkVMService
+
         Write-Host ""
         Write-Host "安装完成。如果界面未立即切换，请在 Language 中选择 $label。" -ForegroundColor Green
+        if ($usedAsarFrontend) {
+            Write-Host "提示：Claude 4.29+ 将前端打包为 ion-dist.asar；安装器已更新其完整性哈希，Claude.exe 的原始 Authenticode 签名会失效。" -ForegroundColor DarkYellow
+        }
+        else {
+            Write-Host "提示：本补丁不改动 app.asar / Claude.exe，官方账号登录界面请直接使用 Claude 自带的语言设置。" -ForegroundColor DarkGray
+        }
     }
     catch {
+        Write-Host ""
+        Write-Host "安装过程中出现错误，Claude Desktop 可能处于不完整状态。" -ForegroundColor Red
+        Write-Host "  建议运行卸载命令恢复原始状态：install-windows.bat → 选择卸载。" -ForegroundColor DarkYellow
+        Write-Host "  详细日志: $script:InstallLogPath" -ForegroundColor DarkGray
         if ($script:DetectedMultipleClaudeInstalls) {
             Write-MultipleClaudeFailureHint
         }
         throw
+    }
+    finally {
+        if ($null -ne $patchTarget) {
+            Close-FrontendPatchTarget $patchTarget
+        }
+        $mutex.ReleaseMutex()
+        $mutex.Dispose()
     }
 }
 
 function Uninstall-WindowsLanguagePack {
     Write-Host "=== Claude Desktop Windows 中文补丁卸载 ===" -ForegroundColor Cyan
 
-    $oldSkipAsarPatch = $SkipAsarPatch
-    $SkipAsarPatch = $true
-    try {
-        $paths = Get-ClaudeResourcesPath
-    }
-    finally {
-        $SkipAsarPatch = $oldSkipAsarPatch
-    }
+    $paths = Get-ClaudeResourcesPath
     $claudePath = $paths["App"]
     $resourcesPath = $paths["Resources"]
+
+    # 旧版本提供过 Frida 常驻模式，相关脚本已移除。这里只做一次性兜底清理，
+    # 让从旧版升级的用户不会残留计划任务和便携运行时。
+    Remove-LegacyFridaResident
 
     Write-Step "关闭 Claude Desktop"
     Stop-ClaudeProcesses
     Remove-LegacyAppxForkArtifacts
 
     Write-Step "[1/4] 恢复前端 bundle 和 app.asar"
+    $workspacePath = Join-Path $resourcesPath "ion-dist"
+    $markerPath = Join-Path $resourcesPath ".zh-cn-asar-extracted"
+    if ((Test-Path -LiteralPath $markerPath -PathType Leaf) -and (Test-Path -LiteralPath $workspacePath)) {
+        Remove-GeneratedFrontendWorkspace $resourcesPath $workspacePath
+        Remove-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
+    }
     Restore-LatestBackup $resourcesPath
     Sync-ClaudeExeAsarIntegrity $resourcesPath
 
@@ -2467,22 +3187,110 @@ function Uninstall-WindowsLanguagePack {
     Write-Host "卸载完成。请重启 Claude Desktop 使更改生效。" -ForegroundColor Green
 }
 
+function Remove-LegacyFridaResident {
+    # Frida 常驻模式已从本项目中移除。仅清理旧版本可能留下的计划任务、
+    # 进程和便携运行时，避免升级后残留后台任务。
+    $taskNames = @("ClaudeDesktopZhCn-FridaZh", "ClaudeDesktopZhCn-FridaResident")
+    foreach ($taskName in $taskNames) {
+        try {
+            $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            if ($existing) {
+                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+                Write-Host "  已移除旧的 Frida 常驻计划任务: $taskName" -ForegroundColor Green
+            }
+        }
+        catch {
+        }
+    }
+
+    foreach ($pattern in @("frida_launch_zh_win.py", "run_frida_zh_win.ps1")) {
+        try {
+            Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -and $_.CommandLine.Contains($pattern) } |
+                ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        }
+        catch {
+        }
+    }
+
+    $runtimeDir = Join-Path $env:LOCALAPPDATA "claude-zh"
+    if (Test-Path -LiteralPath $runtimeDir) {
+        try {
+            Remove-Item -LiteralPath $runtimeDir -Recurse -Force -ErrorAction Stop
+            Write-Host "  已清理旧的 Frida 便携运行时: $runtimeDir" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "  [提示] 无法清理 $runtimeDir（可忽略）: $($_.Exception.Message)" -ForegroundColor DarkYellow
+        }
+    }
+}
+
+function Invoke-PreInstallCleanup {
+    if ($script:PreInstallCleanupDone) {
+        return
+    }
+    $script:PreInstallCleanupDone = $true
+
+    Write-Host "=== 安装前清理旧中文补丁 ===" -ForegroundColor Cyan
+
+    $paths = Get-ClaudeResourcesPath
+    $resourcesPath = $paths["Resources"]
+    $backupRoot = Get-BackupRoot $resourcesPath
+    $backup = $null
+    if (Test-Path $backupRoot) {
+        $backup = Get-ChildItem $backupRoot -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name |
+            Select-Object -First 1
+    }
+    if (-not $backup) {
+        Write-Host "  未找到旧中文补丁备份，跳过预卸载。" -ForegroundColor DarkYellow
+        return
+    }
+
+    Uninstall-WindowsLanguagePack
+}
+
+$LanguageCode = $Language
+
 try {
+    # 交互选择也必须放在 try 里（issue #199）：选择阶段抛异常（例如检测不到
+    # Claude 安装、预清理失败、配置文件损坏）时，如果没人接住，PowerShell
+    # 进程会直接退出，用户看到的就是"窗口一闪而过"。
+    if ($Interactive) {
+        $interactiveSelection = Read-InteractiveSelection
+        $Action = $interactiveSelection.Action
+        $Language = $interactiveSelection.Language
+        $LanguageCode = $Language
+    }
+
     switch ($Action) {
-        "install" { Install-WindowsLanguagePack }
+        "install" {
+            Invoke-PreInstallCleanup
+            Install-WindowsLanguagePack
+        }
         "uninstall" { Uninstall-WindowsLanguagePack }
-        "disable-updates" { Set-ThirdPartyAutoUpdates $false }
-        "enable-updates" { Set-ThirdPartyAutoUpdates $true }
+        "disable-updates" { Set-ClaudeAutoUpdates $false }
+        "enable-updates" { Set-ClaudeAutoUpdates $true }
+        "sync-skills" { Sync-CCSwitchSkills }
+        "unsync-skills" { Unsync-CCSwitchSkills }
     }
 
     Stop-InstallLog
+    if ($Interactive) {
+        # 成功后也留一个停顿，否则管理员窗口会瞬间关闭，用户看不到结果（issue #199）
+        Write-Host ""
+        [void](Read-Host "操作完成，按 Enter 关闭此窗口")
+    }
     exit 0
 }
 catch {
     Write-Host ""
     Write-Host "[错误] $($_.Exception.Message)" -ForegroundColor Red
-    if ($script:InstallLogPath) {
-        Write-Host "[错误] 详细日志已写入: $script:InstallLogPath" -ForegroundColor Red
+    if ($_.ScriptStackTrace) {
+        Write-Host "[错误] 出错位置: $($_.ScriptStackTrace)" -ForegroundColor DarkGray
+    }
+    if ($script:InstallLogPath -and (Test-Path -LiteralPath $script:InstallLogPath)) {
+        Write-Host "[错误] 详细日志已写入: $($script:InstallLogPath)" -ForegroundColor Red
     }
     Stop-InstallLog
     if ($Interactive) {

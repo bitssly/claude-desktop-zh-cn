@@ -29,7 +29,6 @@ import struct
 import sys
 import tempfile
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -40,37 +39,99 @@ RESOURCES = ROOT / "resources"
 BACKUP_GLOB = "Claude.backup-before-zh-CN-*.app"
 
 APP_ASAR_REL = Path("Contents/Resources/app.asar")
-FRONTEND_I18N_REL = Path("Contents/Resources/ion-dist/i18n")
-FRONTEND_ASSETS_REL = Path("Contents/Resources/ion-dist/assets/v1")
+ELECTRON_FRAMEWORK_REL = Path("Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework")
+# Electron 37+ 在 macOS 的 Electron Framework 里预埋字典摘要槽位（sentinel + used + version + SHA256），
+# 运行时用它校验整个 ElectronAsarIntegrity 字典未被篡改；改动字典后必须同步更新该槽位。
+INTEGRITY_DIGEST_SENTINEL = b"AGbevlPCksUGKNL8TSn7wGmJEuJsXb2A"
+# Claude 4.29 起前端整体打包为 ion-dist.asar；更早版本是 ion-dist 目录。
+FRONTEND_ASAR_REL = Path("Contents/Resources/ion-dist.asar")
+FRONTEND_DIR_REL = Path("Contents/Resources/ion-dist")
+FRONTEND_I18N_REL = FRONTEND_DIR_REL / "i18n"
+FRONTEND_ASSETS_REL = FRONTEND_DIR_REL / "assets/v1"
+FRONTEND_PROBE_NEEDLE = '"en-US","de-DE","fr-FR","ko-KR","ja-JP"'
 DESKTOP_RESOURCES_REL = Path("Contents/Resources")
-ASAR_PATCH_TARGET = ".vite/build/index.js"
 ASAR_INTEGRITY_BLOCK_SIZE = 4 * 1024 * 1024
-ONLINE_LOCALE_PRELOAD_TARGETS = [
-    ".vite/build/mainView.js",
-    ".vite/build/mainWindow.js",
-]
-ONLINE_LOCALE_MARKER = "__claudeZhOnlineLocale"
-ONLINE_LOCALE_MAIN_MARKER = "__claudeZhOnlineLocaleMain"
-ONLINE_TRANSLATION_MAX_SOURCE_LEN = 240
-STRUCTURAL_JS_STRING_REPLACEMENTS = {
-    "hour",
-    "hours",
-    "minute",
-    "minutes",
-    "second",
-    "seconds",
-    "day",
-    "days",
-    "week",
-    "weeks",
-    "month",
-    "months",
-    "year",
-    "years",
-}
+# 纯小写单词（hours、tokens、matches……）在打包后的 JS 里几乎都是对象键、枚举值或
+# 状态值，而不是可见文案；静态替换会改坏程序逻辑（例如用量图表按 "tokens" 取指标，
+# 被改成 "令牌" 后读 undefined.daily 使会话页整页崩溃）。这类词条只走在线 DOM 翻译。
+STRUCTURAL_JS_IDENTIFIER_RE = re.compile(r"[a-z][A-Za-z0-9_]*")
+# 结构性字面量跳过列表：兼作图标名、按键映射、事件后缀、枚举值或核心标识符的高危单词（#193, #204, #205, #206）。
+# 这些短词在前端 bundle 中几乎都承担程序逻辑（图标字形查询、按键事件处理、动画状态、无障碍节点判断等），
+# 真正的可见文案全部由官方 i18n（React Intl defaultMessage）映射翻译，静态替换只会破坏运行时。
 STRUCTURAL_JS_LITERAL_REPLACEMENTS = {
     '"Search"',
+    "Search",
+    '"Add"',
+    "Add",
+    '"Copy"',
+    "Copy",
+    '"Check"',
+    "Check",
+    '"Tasks"',
+    "Tasks",
+    '"Settings"',
+    "Settings",
+    '"Command"',
+    "Command",
+    '"Cancel"',
+    "Cancel",
+    '"Sort"',
+    "Sort",
+    '"Voice"',
+    "Voice",
+    '"Default"',
+    "Default",
+    '"Arguments"',
+    "Arguments",
+    '"Normal"',
+    "Normal",
+    '"All"',
+    "All",
+    '"Application"',
+    "Application",
+    '"Medium"',
+    "Medium",
+    '"Motion"',
+    "Motion",
+    '"Thinking"',
+    "Thinking",
+    '"Verbose"',
+    "Verbose",
 }
+# 结构上下文保护：除 KEY:"X" 直接形式外，还需覆盖压缩代码里同样把值当图标名/枚举名
+# 使用的写法（缺一不可，否则字符串被译成中文后按名查图标表失败，按钮渲染成空白方块）：
+#   icon:i="Add"            解构默认值
+#   icon:f?"Add":void 0     三元第一分支（条件可含 ===、void 0 等，如 icon:t===void 0?）
+#   icon:d?"Check":"Copy"   三元第二分支（允许嵌套链 icon:a?"B":c?"Check":"Copy"）
+#   icon:e.length===0?"A":"B"  复杂条件
+#   icon:c}=e;h=c===void 0?"Add":c  解构别名默认值与空值合并（#204）
+# 键名用 [\w$-]*[Ii]con(?:Name)? 覆盖 Icon、primaryActionCompactIcon、openIcon、
+# triggerIcon 等大小写与复合形态。条件原子排除 ? : , ; { } 与引号（引号仅允许成对的
+# 短字符串），避免吞掉后续属性导致紧跟其后的 title:"X" 等正常文案被误保护。
+_STRUCTURAL_COND = (
+    r"(?:(?:[^?:\"'`,;{}]|\"[^\"]{0,60}\"|'[^']{0,60}'|`[^`]{0,60}`){1,120}?)"
+)
+_STRUCTURAL_QUOTED = r"(?:\"[^\"]{0,80}\"|'[^']{0,80}'|`[^`]{0,80}`)"
+STRUCTURAL_JS_LITERAL_CONTEXT_RE = re.compile(
+    r"(?<![A-Za-z0-9_$-])"
+    r"(?:as|component|displayName|glyph|[\w$-]*[Ii]con(?:Name)?|name|role|type)"
+    r"\s*[:=]\s*"
+    r"(?:(?:"
+    + _STRUCTURAL_COND
+    + r"\?\??\s*"
+    + _STRUCTURAL_QUOTED
+    + r"\s*:\s*)*)"
+    r"(?:"
+    + _STRUCTURAL_COND
+    + r"(?:\?\??)?\s*)?(?:=\s*)?$"
+)
+STRUCTURAL_JS_ALIAS_CONTEXT_RE = re.compile(
+    r"(?<![A-Za-z0-9_$-])[\w$-]*[Ii]con(?:Name)?\s*:\s*(?P<alias>[A-Za-z0-9_$]+)\b"
+    r".*?"
+    r"(?:=\s*(?P=alias)\s*===\s*void 0\s*\?\s*"
+    r"|=\s*(?P=alias)\s*!==\s*void 0\s*\?\s*(?P=alias)\s*:\s*"
+    r"|(?<![A-Za-z0-9_$-])(?P=alias)\s*\?\?\s*)$"
+)
 
 
 def log(message: str) -> None:
@@ -97,8 +158,8 @@ def get_language_config(lang_code: str) -> dict[str, Any]:
         "statsig_translation": RESOURCES / f"statsig-{lang_code}.json",
         "label": {
             "zh-CN": "简体中文",
-            "zh-TW": "繁体中文（中国台湾）",
-            "zh-HK": "繁体中文（中国香港）",
+            "zh-TW": "繁體中文（台灣）",
+            "zh-HK": "繁體中文（香港）",
         }.get(lang_code, lang_code),
     }
 
@@ -137,10 +198,11 @@ def load_entitlements(path: Path) -> dict[str, Any]:
         stderr=subprocess.PIPE,
         check=False,
     )
-    if result.returncode != 0 or not result.stdout.strip():
+    stdout = result.stdout.rstrip(b"\x00")
+    if result.returncode != 0 or not stdout.strip():
         return {}
     try:
-        data = plistlib.loads(result.stdout)
+        data = plistlib.loads(stdout)
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
@@ -168,40 +230,80 @@ def copy_app(src: Path, dst: Path) -> None:
     log(f"Copied app to temporary workspace in {elapsed_since(start)}")
 
 
+def find_frontend_assets_dir(app: Path) -> Path | None:
+    """Locate the frontend JS bundle directory under the app.
+
+    已知布局（Claude 2.x 至 2.31226.1）是 Contents/Resources/ion-dist/assets/v1；
+    新版本若改名或换层级，则在 ion-dist 下递归查找：优先返回命中语言白名单锚点
+    的目录（前端主 bundle），其次含 index-*.js 的目录，避免误选 worker 等辅助
+    JS 目录（issue #196 同类风险的 Mac 侧防线）。
+    """
+    known = app / FRONTEND_ASSETS_REL
+    if any(known.glob("*.js")):
+        return known
+
+    ion_dist = app / "Contents/Resources/ion-dist"
+    if not ion_dist.is_dir():
+        return None
+
+    needle_hits: list[Path] = []
+    index_dirs: list[Path] = []
+    for js_path in sorted(ion_dist.rglob("*.js")):
+        if not js_path.is_file():
+            continue
+        if js_path.name.startswith("index-") and js_path.parent not in index_dirs:
+            index_dirs.append(js_path.parent)
+        if js_path.parent not in needle_hits:
+            try:
+                if FRONTEND_PROBE_NEEDLE in js_path.read_text(encoding="utf-8"):
+                    needle_hits.append(js_path.parent)
+            except (OSError, UnicodeDecodeError):
+                continue
+
+    if needle_hits:
+        return needle_hits[0]
+    if index_dirs:
+        return index_dirs[0]
+    return None
+
+
 def patch_language_whitelist(app: Path, lang_code: str) -> Path:
-    assets_dir = app / FRONTEND_ASSETS_REL
-    candidates = sorted(assets_dir.glob("index-*.js"))
-    if not candidates:
-        raise SystemExit(f"Cannot find frontend index bundle in {assets_dir}")
+    assets_dir = find_frontend_assets_dir(app)
+    if assets_dir is None:
+        raise SystemExit(
+            f"Cannot find frontend JS bundle under {app / 'Contents/Resources/ion-dist'} "
+            f"(looked for {FRONTEND_ASSETS_REL} and any index bundle with the language whitelist)"
+        )
+    candidates = sorted(assets_dir.glob("*.js"))
 
     replacement = f'{BASE_LANGUAGE_LIST},"{lang_code}"]'
 
     for path in candidates:
         text = path.read_text(encoding="utf-8")
-        if replacement in text:
-            print(f"Language whitelist already contains {lang_code}: {path.name}")
-            return path
         if LANG_LIST_RE.search(text):
-            patched = LANG_LIST_RE.sub(
-                replacement,
-                text,
-                count=1,
-            )
+            # Claude 2.9939.2 起同一 bundle 内有多份语言白名单（导航语言解析与
+            # 语言可用性校验各一份），必须全部补上，漏一份该路径就会把 zh 回退
+            # 成 en-US。正则会吞掉已存在的 zh 项，重复运行是幂等的。
+            patched, occurrences = LANG_LIST_RE.subn(replacement, text)
             path.write_text(patched, encoding="utf-8")
-            print(f"Patched language whitelist: {path.name}")
+            print(f"Patched language whitelist: {path.name} ({occurrences} occurrence(s))")
             return path
 
     raise SystemExit("Could not patch language whitelist. Claude's bundle format may have changed.")
 
 
 def patch_language_display_names(app: Path) -> None:
-    assets_dir = app / FRONTEND_ASSETS_REL
+    assets_dir = find_frontend_assets_dir(app)
+    if assets_dir is None:
+        raise SystemExit(
+            f"Cannot find frontend JS bundle under {app / 'Contents/Resources/ion-dist'}"
+        )
     candidates = sorted(assets_dir.glob("index-*.js"))
     if not candidates:
         raise SystemExit(f"Cannot find frontend index bundle in {assets_dir}")
 
     marker = "__claudeZhLabelPatch"
-    patch = ';(()=>{const e=Intl.DisplayNames&&Intl.DisplayNames.prototype;if(!e||e.__claudeZhLabelPatch)return;const n=e.of;e.of=function(e){const t=String(e);return t==="zh-CN"?"简体中文":t==="zh-HK"?"繁体中文（中国香港）":t==="zh-TW"?"繁体中文（中国台湾）":n.call(this,e)},Object.defineProperty(e,"__claudeZhLabelPatch",{value:!0})})();'
+    patch = ';(()=>{const e=Intl.DisplayNames&&Intl.DisplayNames.prototype;if(!e||e.__claudeZhLabelPatch)return;const n=e.of;e.of=function(e){const t=String(e);return t==="zh-CN"?"简体中文":t==="zh-HK"?"繁體中文（香港）":t==="zh-TW"?"繁體中文（台灣）":n.call(this,e)},Object.defineProperty(e,"__claudeZhLabelPatch",{value:!0})})();'
     for path in candidates:
         text = path.read_text(encoding="utf-8")
         if marker in text:
@@ -236,8 +338,21 @@ def is_plain_ui_text_replacement(source: str) -> bool:
     return "\n" not in source and not any(marker in source for marker in code_markers)
 
 
-def replace_frontend_hardcoded_text(text: str, source: str, target: str) -> tuple[str, int]:
-    if source in STRUCTURAL_JS_STRING_REPLACEMENTS or source in STRUCTURAL_JS_LITERAL_REPLACEMENTS:
+def is_structural_js_literal_context(text: str, literal_start: int) -> bool:
+    prefix = text[max(0, literal_start - 160) : literal_start]
+    if STRUCTURAL_JS_ALIAS_CONTEXT_RE.search(prefix) is not None:
+        return True
+    short_prefix = prefix[-96:] if len(prefix) > 96 else prefix
+    return STRUCTURAL_JS_LITERAL_CONTEXT_RE.search(short_prefix) is not None
+
+
+def replace_frontend_hardcoded_text(
+    text: str,
+    source: str,
+    target: str,
+    pattern: re.Pattern[str] | None = None,
+) -> tuple[str, int]:
+    if STRUCTURAL_JS_IDENTIFIER_RE.fullmatch(source) or source in STRUCTURAL_JS_LITERAL_REPLACEMENTS:
         return text, 0
 
     if not is_plain_ui_text_replacement(source):
@@ -246,54 +361,234 @@ def replace_frontend_hardcoded_text(text: str, source: str, target: str) -> tupl
             text = text.replace(source, target)
         return text, count
 
-    pattern = re.compile(r'(?P<quote>["\'`])' + re.escape(source) + r"(?P=quote)")
+    if pattern is None:
+        pattern = re.compile(r'(?P<quote>["\'`])' + re.escape(source) + r"(?P=quote)")
+    replacement_count = 0
 
     def replace_match(match: re.Match[str]) -> str:
+        nonlocal replacement_count
+        if is_structural_js_literal_context(text, match.start()):
+            return match.group(0)
+        replacement_count += 1
         quote = match.group("quote")
         return f"{quote}{target}{quote}"
 
-    return pattern.subn(replace_match, text)
+    return pattern.sub(replace_match, text), replacement_count
+
+
+_WORKER_RULES: list[tuple[str, str, "re.Pattern[str] | None"]] = []
+
+
+def _prepare_hardcoded_rules(
+    replacement_items: list[tuple[str, str]],
+) -> list[tuple[str, str, "re.Pattern[str] | None"]]:
+    return [
+        (
+            source,
+            target,
+            re.compile(r'(?P<quote>["\'`])' + re.escape(source) + r"(?P=quote)")
+            if is_plain_ui_text_replacement(source)
+            else None,
+        )
+        for source, target in replacement_items
+        if not (
+            STRUCTURAL_JS_IDENTIFIER_RE.fullmatch(source)
+            or source in STRUCTURAL_JS_LITERAL_REPLACEMENTS
+        )
+    ]
+
+
+def _init_patch_worker(replacement_items: list[tuple[str, str]]) -> None:
+    global _WORKER_RULES
+    _WORKER_RULES = _prepare_hardcoded_rules(replacement_items)
+
+
+def _patch_frontend_file(path_str: str) -> tuple[bool, int]:
+    path = Path(path_str)
+    text = path.read_text(encoding="utf-8")
+    # 任何替换（引号包裹或直接替换）都要求原文至少出现一次，粗筛可跳过绝大多数无命中文件。
+    if not any(source in text for source, _, _ in _WORKER_RULES):
+        return False, 0
+    patched = text
+    count = 0
+    for source, target, pattern in _WORKER_RULES:
+        patched, occurrences = replace_frontend_hardcoded_text(patched, source, target, pattern)
+        if occurrences:
+            count += occurrences
+    if patched != text:
+        path.write_text(patched, encoding="utf-8")
+        return True, count
+    return False, 0
 
 
 def patch_hardcoded_frontend_strings(app: Path, lang_code: str) -> None:
     start = time.perf_counter()
-    assets_dir = app / FRONTEND_ASSETS_REL
+    assets_dir = find_frontend_assets_dir(app)
+    if assets_dir is None:
+        raise SystemExit(
+            f"Cannot find frontend JS bundle under {app / 'Contents/Resources/ion-dist'}"
+        )
     replacement_items = sorted(
         load_frontend_hardcoded_replacements(lang_code),
         key=lambda item: len(item[0]),
         reverse=True,
     )
     js_files = sorted(assets_dir.glob("*.js"))
-    patched_files = 0
-    patched_strings = 0
+    total_files = len(js_files)
 
     log(
         "Scanning frontend JS for hardcoded strings: "
-        f"{len(js_files)} files, {len(replacement_items)} replacement rules"
+        f"{total_files} files, {len(replacement_items)} replacement rules"
     )
-    for index, path in enumerate(js_files, start=1):
-        text = path.read_text(encoding="utf-8")
-        patched = text
-        count = 0
-        for source, target in replacement_items:
-            patched, occurrences = replace_frontend_hardcoded_text(patched, source, target)
-            if occurrences:
-                count += occurrences
-        if patched != text:
-            path.write_text(patched, encoding="utf-8")
-            patched_files += 1
-            patched_strings += count
-        if index % 50 == 0 or index == len(js_files):
+
+    patched_files = 0
+    patched_strings = 0
+
+    def report(index: int) -> None:
+        if index % 50 == 0 or index == total_files:
             log(
                 "  scanned "
-                f"{index}/{len(js_files)} JS files, "
+                f"{index}/{total_files} JS files, "
                 f"{patched_strings} replacements so far ({elapsed_since(start)})"
             )
+
+    pool = None
+    results = None
+    workers = min(os.cpu_count() or 1, 12)
+    if workers > 1 and total_files > 64:
+        try:
+            from concurrent.futures import ProcessPoolExecutor
+
+            # 文件互相独立，可并行；大文件先派发以均衡各 worker 负载。
+            # 子进程启动/任务提交可能因受限环境失败，整体回退单进程；
+            # 而迭代结果阶段的工作异常仍会照常抛出终止安装。
+            by_size = sorted(js_files, key=lambda p: p.stat().st_size, reverse=True)
+            pool = ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_init_patch_worker,
+                initargs=(replacement_items,),
+            )
+            results = pool.map(_patch_frontend_file, (str(p) for p in by_size), chunksize=1)
+        except Exception as exc:
+            log(f"Parallel scan unavailable ({type(exc).__name__}: {exc}); falling back to single process")
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
+            pool = None
+            results = None
+
+    if pool is not None and results is not None:
+        try:
+            for index, (file_patched, count) in enumerate(results, start=1):
+                patched_files += int(file_patched)
+                patched_strings += count
+                report(index)
+        finally:
+            pool.shutdown()
+    else:
+        _init_patch_worker(replacement_items)
+        for index, path in enumerate(js_files, start=1):
+            file_patched, count = _patch_frontend_file(str(path))
+            patched_files += int(file_patched)
+            patched_strings += count
+            report(index)
 
     log(
         "Patched hardcoded frontend strings: "
         f"{patched_strings} replacements in {patched_files} files ({elapsed_since(start)})"
     )
+
+
+def load_slash_command_gloss_config(lang_code: str) -> tuple[dict[str, Any], dict[str, str]]:
+    profile = load_json(RESOURCES / "slash-command-menu-patch.json")
+    labels = load_json(RESOURCES / "slash-command-glosses.json")[lang_code]
+    if not isinstance(labels, dict) or not labels or any(
+        not re.fullmatch(r"[a-z][a-z0-9-]*", key)
+        or not isinstance(value, str) or not value.strip()
+        for key, value in labels.items()
+    ):
+        raise ValueError("Invalid slash command gloss catalog")
+    return profile, labels
+
+
+def _slash_gloss_replacement(match: re.Match[str], profile: dict[str, Any], patched: bool = False) -> str:
+    original = match.group(0).split(":", 1)[1].lstrip()
+    if patched:
+        original = original[1:]
+    values = {"__ORIGINAL__": original, "__ITEM__": match.group(3), "__JSX__": match.group(1)}
+    return re.sub(r"__ORIGINAL__|__ITEM__|__JSX__", lambda token: values[token.group(0)], profile["replacement"])
+
+
+def replace_slash_command_menu_text(
+    text: str, profile: dict[str, Any], labels: dict[str, str]
+) -> tuple[str, str]:
+    """只修改真实菜单行的显示层，不修改 label、命令 ID、搜索和点击回调。"""
+    if not re.search(profile["module_pattern"], text):
+        raise ValueError("SlashCommandMenuPopupBody export not found")
+    marker = profile["marker"]
+    encoded = json.dumps(labels, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    encoded = encoded.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+    suffix = "\n" + marker + profile["suffix"].replace("__LABELS__", encoded)
+    if marker in text:
+        if text.count(marker) != 1 or "\n" + marker not in text:
+            raise ValueError("Ambiguous slash command gloss marker")
+        body, tail = text.split("\n" + marker, 1)
+        left, right = profile["suffix"].split("__LABELS__", 1)
+        if not tail.startswith(left) or not tail.endswith(right):
+            raise ValueError("Unrecognized existing slash command helper")
+        try:
+            previous_labels = json.loads(tail[len(left):len(tail) - len(right)])
+        except json.JSONDecodeError as exc:
+            raise ValueError("Invalid existing slash command catalog") from exc
+        pattern = profile["anchor_pattern"].replace("children:", r"children:\[", 1)
+        matches = list(re.finditer(pattern, body))
+        if len(matches) != 1:
+            raise ValueError("Existing slash menu row is missing or ambiguous")
+        replacement = _slash_gloss_replacement(matches[0], profile, patched=True)
+        start = matches[0].start()
+        if body[start:start + len(replacement)] != replacement:
+            raise ValueError("Existing slash menu row does not match the patch")
+        if previous_labels == labels:
+            return text, "already"
+        return body + suffix, "updated"
+
+    if "__claudeZhSlashGloss" in text or "__claudeZhSlashLabels" in text:
+        raise ValueError("Slash command helper name already exists")
+    matches = list(re.finditer(profile["anchor_pattern"], text))
+    if len(matches) != 1:
+        raise ValueError("Expected exactly one slash menu label anchor")
+    match = matches[0]
+    if not re.search(re.escape(match.group(3)) + r'\.type\s*===\s*"skill"', text):
+        raise ValueError("Slash menu skill row not found")
+    updated = text[:match.start()] + _slash_gloss_replacement(match, profile) + text[match.end():]
+    return updated + suffix, "updated"
+
+
+def patch_slash_command_menu(app: Path, lang_code: str) -> int:
+    assets_dir = find_frontend_assets_dir(app)
+    if assets_dir is None:
+        log("WARNING: Slash command gloss skipped: frontend assets not found")
+        return 0
+    profile, labels = load_slash_command_gloss_config(lang_code)
+    candidates = []
+    for path in sorted(assets_dir.glob("*.js")):
+        text = path.read_text(encoding="utf-8")
+        if re.search(profile["module_pattern"], text):
+            candidates.append((path, text))
+    if len(candidates) != 1:
+        log("WARNING: Slash command gloss skipped: expected one menu component")
+        return 0
+    path, text = candidates[0]
+    try:
+        updated, status = replace_slash_command_menu_text(text, profile, labels)
+    except ValueError as exc:
+        log(f"WARNING: Slash command gloss skipped: {exc}")
+        return 0
+    if status == "already":
+        log(f"Slash command gloss already installed: {path.name}")
+        return 0
+    path.write_text(updated, encoding="utf-8")
+    log(f"Patched bilingual slash command menu ({lang_code}): {path.name}")
+    return 1
 
 
 def align4(value: int) -> int:
@@ -325,78 +620,61 @@ def read_asar_header(data: bytes, path: Path) -> tuple[int, str, dict[str, Any]]
     return header_size, header_string, header
 
 
-def encode_asar_header(header_string: str, expected_header_size: int) -> bytes:
-    header_bytes = header_string.encode("utf-8")
-    header_payload_size = align4(4 + len(header_bytes))
-    header_pickle = (
-        struct.pack("<I", header_payload_size)
-        + struct.pack("<i", len(header_bytes))
-        + header_bytes
-        + b"\0" * (header_payload_size - 4 - len(header_bytes))
-    )
-    if len(header_pickle) != expected_header_size:
-        raise SystemExit("Internal patch error: app.asar header length changed.")
-    return struct.pack("<I", 4) + struct.pack("<I", expected_header_size) + header_pickle
+def walk_asar_entries(header: dict[str, Any]):
+    """Yield (relative_path, entry) for every file entry in an ASAR header."""
+    stack: list[tuple[str, dict[str, Any]]] = [("", header)]
+    while stack:
+        prefix, node = stack.pop()
+        files = node.get("files") if isinstance(node, dict) else None
+        if not isinstance(files, dict):
+            continue
+        for name, child in files.items():
+            if not isinstance(child, dict):
+                continue
+            relative = f"{prefix}/{name}" if prefix else name
+            if "files" in child:
+                stack.append((relative, child))
+            else:
+                yield relative, child
 
 
-def encode_asar_header_dynamic(header_string: str) -> bytes:
-    header_bytes = header_string.encode("utf-8")
-    header_payload_size = align4(4 + len(header_bytes))
-    header_pickle = (
-        struct.pack("<I", header_payload_size)
-        + struct.pack("<i", len(header_bytes))
-        + header_bytes
-        + b"\0" * (header_payload_size - 4 - len(header_bytes))
-    )
-    return struct.pack("<I", 4) + struct.pack("<I", len(header_pickle)) + header_pickle
-
-
-def get_asar_file_entry(header: dict[str, Any], file_path: str) -> dict[str, Any]:
-    node: dict[str, Any] = header
-    for part in file_path.split("/"):
-        files = node.get("files")
+def asar_entry(header: dict[str, Any], relative: str) -> dict[str, Any] | None:
+    node: Any = header
+    for part in relative.split("/"):
+        files = node.get("files") if isinstance(node, dict) else None
         if not isinstance(files, dict) or part not in files:
-            raise SystemExit(f"Could not find {file_path} in app.asar header.")
-        child = files[part]
-        if not isinstance(child, dict):
-            raise SystemExit(f"Unsupported app.asar header entry for {file_path}.")
-        node = child
-    for key in ["size", "offset", "integrity"]:
-        if key not in node:
-            raise SystemExit(f"Missing {key} for {file_path} in app.asar header.")
+            return None
+        node = files[part]
+    if not isinstance(node, dict) or "files" in node:
+        return None
     return node
 
 
-def iter_asar_file_entries(header: dict[str, Any]) -> list[dict[str, Any]]:
-    entries: list[dict[str, Any]] = []
-
-    def walk(node: dict[str, Any]) -> None:
-        files = node.get("files")
-        if not isinstance(files, dict):
-            return
-        for child in files.values():
-            if not isinstance(child, dict):
-                continue
-            if "files" in child:
-                walk(child)
-            elif "offset" in child and "size" in child:
-                entries.append(child)
-
-    walk(header)
-    return entries
+def read_asar_entry(data: bytes, header_size: int, header: dict[str, Any], relative: str) -> bytes | None:
+    """Read one file entry from an in-memory ASAR archive."""
+    entry = asar_entry(header, relative)
+    if entry is None or entry.get("unpacked"):
+        return None
+    offset = int(entry["offset"])
+    size = int(entry["size"])
+    start = 8 + header_size + offset
+    if offset < 0 or size < 0 or start + size > len(data):
+        raise SystemExit(f"ASAR 文件边界无效: {relative}")
+    return data[start : start + size]
 
 
-def set_asar_offset(entry: dict[str, Any], offset: int) -> None:
-    entry["offset"] = str(offset) if isinstance(entry.get("offset"), str) else offset
+def asar_header_hash(header_string: str) -> str:
+    return hashlib.sha256(header_string.encode("utf-8")).hexdigest()
 
 
-def calculate_file_integrity(data: bytes) -> dict[str, Any]:
+def _asar_integrity(path: Path) -> dict[str, Any]:
+    data = path.read_bytes()
     blocks = [
         hashlib.sha256(data[offset : offset + ASAR_INTEGRITY_BLOCK_SIZE]).hexdigest()
         for offset in range(0, len(data), ASAR_INTEGRITY_BLOCK_SIZE)
     ]
     if not blocks:
-        blocks.append(hashlib.sha256(data).hexdigest())
+        blocks = [hashlib.sha256(b"").hexdigest()]
     return {
         "algorithm": "SHA256",
         "hash": hashlib.sha256(data).hexdigest(),
@@ -405,743 +683,345 @@ def calculate_file_integrity(data: bytes) -> dict[str, Any]:
     }
 
 
-def replace_asar_file_content(app: Path, file_path: str, patched_content: bytes) -> bool:
-    path = app / APP_ASAR_REL
-    require_file(path)
+def extract_asar(asar_path: Path, destination: Path, unpacked: set[str] | None = None) -> None:
+    """Expand an ASAR archive into *destination*.
 
-    data = bytearray(path.read_bytes())
-    header_size, _header_string, header = read_asar_header(data, path)
-    entry = get_asar_file_entry(header, file_path)
-    content_offset = 8 + header_size + int(entry["offset"])
-    content_size = int(entry["size"])
-    content_end = content_offset + content_size
-    if content_offset < 0 or content_end > len(data):
-        raise SystemExit(f"Unsupported app.asar file bounds for {file_path}.")
+    Files flagged ``unpacked`` are copied from the sibling ``.unpacked`` directory;
+    their relative paths are recorded in *unpacked* so repacking can preserve them.
+    """
+    data = asar_path.read_bytes()
+    header_size, _header_string, header = read_asar_header(data, asar_path)
+    data_start = 8 + header_size
+    unpacked_root = Path(str(asar_path) + ".unpacked")
+    destination.mkdir(parents=True, exist_ok=True)
+    root = destination.resolve()
 
-    old_content = bytes(data[content_offset:content_end])
-    if old_content == patched_content:
+    for relative, entry in walk_asar_entries(header):
+        parts = relative.split("/")
+        if any(part in ("", ".", "..") or "\\" in part for part in parts):
+            raise SystemExit(f"ASAR 包含不安全路径: {relative}")
+        target = (destination / Path(*parts)).resolve()
+        if target != root and root not in target.parents:
+            raise SystemExit(f"ASAR 路径越界: {relative}")
+        if entry.get("link"):
+            raise SystemExit(f"暂不支持包含软链接的 ASAR: {relative}")
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if entry.get("unpacked"):
+            source = unpacked_root / Path(*parts)
+            if not source.is_file():
+                raise SystemExit(f"ASAR unpacked 文件缺失: {relative}")
+            shutil.copy2(source, target)
+            if unpacked is not None:
+                unpacked.add(relative)
+            continue
+
+        offset = int(entry["offset"])
+        size = int(entry["size"])
+        if offset < 0 or size < 0 or data_start + offset + size > len(data):
+            raise SystemExit(f"ASAR 文件边界无效: {relative}")
+        target.write_bytes(data[data_start + offset : data_start + offset + size])
+
+
+def build_asar(source_dir: Path, destination: Path, unpacked: set[str] | None = None) -> None:
+    """Pack *source_dir* into an Electron-compatible ASAR archive."""
+    unpacked = unpacked or set()
+    file_entries: list[tuple[Path, str, dict[str, Any]]] = []
+
+    def walk(directory: Path, node: dict[str, Any]) -> None:
+        for item in sorted(directory.iterdir(), key=lambda path: path.name):
+            if item.is_symlink():
+                raise SystemExit(f"ASAR 源目录包含不支持的软链接: {item}")
+            if item.is_dir():
+                child: dict[str, Any] = {"files": {}}
+                node["files"][item.name] = child
+                walk(item, child)
+            elif item.is_file():
+                relative = str(item.relative_to(source_dir)).replace(os.sep, "/")
+                entry: dict[str, Any] = {"size": item.stat().st_size}
+                node["files"][item.name] = entry
+                file_entries.append((item, relative, entry))
+            else:
+                raise SystemExit(f"ASAR 源目录包含不支持的文件类型: {item}")
+
+    header: dict[str, Any] = {"files": {}}
+    walk(source_dir, header)
+
+    offset = 0
+    for path, relative, entry in file_entries:
+        entry["offset"] = str(offset)
+        entry["integrity"] = _asar_integrity(path)
+        if relative in unpacked:
+            # unpacked 文件不写入归档数据区，Electron 从同名 .unpacked 目录读取。
+            entry["unpacked"] = True
+            continue
+        offset += int(entry["size"])
+
+    header_string = json.dumps(header, separators=(",", ":"), ensure_ascii=False)
+    header_bytes = header_string.encode("utf-8")
+    payload_size = align4(4 + len(header_bytes))
+    header_size = 4 + payload_size
+    prefix = struct.pack("<II", 4, header_size)
+    payload = (
+        struct.pack("<II", payload_size, len(header_bytes))
+        + header_bytes
+        + b"\x00" * (payload_size - 4 - len(header_bytes))
+    )
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".tmp")
+    unpacked_root = Path(str(destination) + ".unpacked")
+    try:
+        with temporary.open("wb") as output:
+            output.write(prefix)
+            output.write(payload)
+            for path, relative, _entry in file_entries:
+                if relative in unpacked:
+                    continue
+                with path.open("rb") as source:
+                    shutil.copyfileobj(source, output)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+    if unpacked:
+        unpacked_root.mkdir(parents=True, exist_ok=True)
+        for relative in sorted(unpacked):
+            source = source_dir / Path(*relative.split("/"))
+            target = unpacked_root / Path(*relative.split("/"))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+
+
+def get_frontend_bundle_mode(app: Path) -> str:
+    if (app / FRONTEND_ASAR_REL).is_file():
+        return "asar"
+    if (app / FRONTEND_DIR_REL).is_dir():
+        return "directory"
+    return "missing"
+
+
+def prepare_frontend_target(app: Path) -> dict[str, Any]:
+    """Expose the frontend bundle as a directory so the existing patches work unchanged.
+
+    Claude 4.29+ ships ``ion-dist.asar``; it is expanded into a temporary
+    ``ion-dist`` directory inside the patched app copy and repacked in
+    :func:`finalize_frontend_target`.
+    """
+    mode = get_frontend_bundle_mode(app)
+    asar = app / FRONTEND_ASAR_REL
+    directory = app / FRONTEND_DIR_REL
+    if mode == "asar":
+        if directory.exists():
+            raise SystemExit(f"前端目录与 ASAR 同时存在，无法安全判定布局: {directory}")
+        unpacked: set[str] = set()
+        extract_asar(asar, directory, unpacked)
+        print(f"Extracted ion-dist.asar for patching ({len(unpacked)} unpacked file(s))")
+        return {"mode": "asar", "work": directory, "asar": asar, "unpacked": unpacked}
+    if mode == "directory":
+        return {"mode": "directory", "work": directory, "asar": None, "unpacked": set()}
+    raise SystemExit(f"未找到前端资源: {directory} 或 {asar}")
+
+
+def finalize_frontend_target(app: Path, target: dict[str, Any]) -> None:
+    if target.get("mode") != "asar":
+        return
+    work: Path = target["work"]
+    asar: Path = target["asar"]
+    if not work.is_dir():
+        raise SystemExit(f"ASAR 临时工作目录不存在: {work}")
+
+    temporary = asar.with_name(asar.name + ".zh-cn-new")
+    print("Rebuilding ion-dist.asar...")
+    build_asar(work, temporary, target.get("unpacked") or set())
+    try:
+        data = temporary.read_bytes()
+        _header_size, _header_string, header = read_asar_header(data, temporary)
+        paths = {relative for relative, _entry in walk_asar_entries(header)}
+        has_i18n = "i18n/en-US.json" in paths
+        has_bundle = any(re.search(r"(^|/)assets/(?:[^/]+/)?index-[^/]+\.js$", path) for path in paths)
+        if not (has_i18n and has_bundle):
+            raise SystemExit("重新打包后的 ion-dist.asar 未通过结构校验。")
+        os.replace(temporary, asar)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+    cleanup_frontend_target(target)
+    update_electron_asar_integrity(app, "Resources/ion-dist.asar", asar)
+    print("Rebuilt ion-dist.asar")
+
+
+def cleanup_frontend_target(target: dict[str, Any] | None) -> None:
+    if not target or target.get("mode") != "asar":
+        return
+    work = target.get("work")
+    if isinstance(work, Path) and work.exists():
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def compute_integrity_dictionary_digest(integrity: dict[str, Any]) -> str:
+    """Digest Electron's package-time integrity dictionary (sorted key + algorithm + hash)."""
+    hasher = hashlib.sha256()
+    for key in sorted(integrity):
+        entry = integrity[key]
+        hasher.update(key.encode("utf-8"))
+        hasher.update(str(entry.get("algorithm", "")).encode("utf-8"))
+        hasher.update(str(entry.get("hash", "")).encode("utf-8"))
+    return hasher.hexdigest()
+
+
+def sync_integrity_digest_slot(app: Path, integrity: dict[str, Any]) -> int:
+    """Update the package-time dictionary digest slot inside Electron Framework.
+
+    Returns the number of patched slots (one per Mach-O slice). Older Electron
+    builds have no slot; those are left untouched.
+    """
+    framework = app / ELECTRON_FRAMEWORK_REL
+    if not framework.is_file():
+        return 0
+    data = bytearray(framework.read_bytes())
+    digest = bytes.fromhex(compute_integrity_dictionary_digest(integrity))
+    updated = 0
+    start = 0
+    while True:
+        index = data.find(INTEGRITY_DIGEST_SENTINEL, start)
+        if index < 0:
+            break
+        slot = index + len(INTEGRITY_DIGEST_SENTINEL)
+        if slot + 34 > len(data):
+            break
+        # used=0 表示打包时未启用字典摘要，保持 fail-open。
+        if data[slot] == 1:
+            data[slot] = 1
+            data[slot + 1] = 1
+            data[slot + 2 : slot + 34] = digest
+            updated += 1
+        start = index + 1
+    if updated:
+        framework.write_bytes(data)
+    return updated
+
+
+def verify_integrity_digest_slot(app: Path, integrity: dict[str, Any]) -> None:
+    framework = app / ELECTRON_FRAMEWORK_REL
+    if not framework.is_file():
+        return
+    data = framework.read_bytes()
+    expected = compute_integrity_dictionary_digest(integrity)
+    start = 0
+    checked = 0
+    while True:
+        index = data.find(INTEGRITY_DIGEST_SENTINEL, start)
+        if index < 0:
+            break
+        slot = index + len(INTEGRITY_DIGEST_SENTINEL)
+        if slot + 34 > len(data):
+            break
+        if data[slot] == 1:
+            actual = data[slot + 2 : slot + 34].hex()
+            if actual != expected:
+                raise SystemExit(
+                    "Electron integrity dictionary digest mismatch in Electron Framework: "
+                    f"binary has {actual!r}, expected {expected}."
+                )
+            checked += 1
+        start = index + 1
+    if checked:
+        print(f"Verified Electron integrity dictionary digest ({checked} slice(s))")
+
+
+def update_electron_asar_integrity(app: Path, key: str, asar_path: Path) -> bool:
+    """Sync Info.plist ElectronAsarIntegrity for *key* when the app declares it."""
+    info_plist = app / "Contents/Info.plist"
+    with info_plist.open("rb") as f:
+        info = plistlib.load(f)
+    integrity = info.get("ElectronAsarIntegrity")
+    if not isinstance(integrity, dict) or key not in integrity:
         return False
-
-    target_offset = int(entry["offset"])
-    delta = len(patched_content) - content_size
-    data[content_offset:content_end] = patched_content
-
-    entry["size"] = len(patched_content)
-    entry["integrity"] = calculate_file_integrity(patched_content)
-    if delta:
-        for other in iter_asar_file_entries(header):
-            if other is not entry and int(other["offset"]) > target_offset:
-                set_asar_offset(other, int(other["offset"]) + delta)
-
-    updated_header_string = json.dumps(header, ensure_ascii=False, separators=(",", ":"))
-    updated_header = encode_asar_header_dynamic(updated_header_string)
-    body = bytes(data[8 + header_size :])
-
-    path.write_bytes(updated_header + body)
-    update_electron_asar_integrity(app, updated_header_string)
+    data = asar_path.read_bytes()
+    _header_size, header_string, _header = read_asar_header(data, asar_path)
+    expected = asar_header_hash(header_string)
+    if integrity[key].get("hash") == expected:
+        return False
+    integrity[key]["hash"] = expected
+    with info_plist.open("wb") as f:
+        plistlib.dump(info, f, fmt=plistlib.FMT_BINARY, sort_keys=False)
+    sync_integrity_digest_slot(app, integrity)
     return True
 
 
-def build_online_locale_injection(lang_code: str) -> str:
-    return (
-        f';(()=>{{const l="{lang_code}",s=()=>{{try{{localStorage.setItem("spa:locale",l);'
-        'document.documentElement&&document.documentElement.setAttribute("lang",l)}}catch{{}}}};'
-        f's();addEventListener("DOMContentLoaded",s)}})();/*{ONLINE_LOCALE_MARKER}*/'
-    )
-
-
-def strip_online_locale_injection(text: str) -> tuple[str, bool]:
-    pattern = re.compile(
-        rf';\(\(\)=>\{{const l="[^"]+".*?/\*{ONLINE_LOCALE_MARKER}\*/',
-        re.DOTALL,
-    )
-    patched, count = pattern.subn("", text)
-    return patched, count > 0
-
-
-def remove_online_locale_preload(content: bytes) -> tuple[bytes, bool]:
-    text = content.decode("utf-8")
-    text, had_existing = strip_online_locale_injection(text)
-    return text.encode("utf-8"), had_existing
-
-
-def patch_online_locale_preload(app: Path, lang_code: str) -> None:
-    path = app / APP_ASAR_REL
-    require_file(path)
-    data = path.read_bytes()
-    header_size, _header_string, header = read_asar_header(data, path)
-
-    removed_count = 0
-    for file_path in ONLINE_LOCALE_PRELOAD_TARGETS:
-        entry = get_asar_file_entry(header, file_path)
-        content_offset = 8 + header_size + int(entry["offset"])
-        content_size = int(entry["size"])
-        content_end = content_offset + content_size
-        if content_offset < 0 or content_end > len(data):
-            raise SystemExit(f"Unsupported app.asar file bounds for {file_path}.")
-
-        content = data[content_offset:content_end]
-        patched_content, changed = remove_online_locale_preload(content)
-        if changed:
-            if replace_asar_file_content(app, file_path, patched_content):
-                removed_count += 1
-            data = path.read_bytes()
-            header_size, _header_string, header = read_asar_header(data, path)
-
-    if removed_count:
-        print(f"Removed stale online claude.ai locale preload: {removed_count} files")
-    else:
-        print("Online claude.ai locale preload not present")
-
-
-def is_online_dom_translation_entry(source: str, target: str) -> bool:
-    if not source or not target or source == target:
-        return False
-    if len(source) > ONLINE_TRANSLATION_MAX_SOURCE_LEN:
-        return False
-    blocked_fragments = ["<", "{", "\n", "http://", "https://"]
-    return not any(fragment in source or fragment in target for fragment in blocked_fragments)
-
-
-def build_online_translation_map(app: Path, lang_code: str) -> dict[str, str]:
-    config = get_language_config(lang_code)
-    en_path = app / FRONTEND_I18N_REL / "en-US.json"
-    require_file(en_path)
-    require_file(config["frontend_translation"])
-
-    en = load_json(en_path)
-    zh = load_json(config["frontend_translation"])
-    if not isinstance(en, dict) or not isinstance(zh, dict):
-        raise SystemExit("Unsupported frontend i18n JSON shape for online DOM translation.")
-
-    mapping: dict[str, str] = {}
-    for key, source in en.items():
-        target = zh.get(key)
-        if isinstance(source, str) and isinstance(target, str) and is_online_dom_translation_entry(source, target):
-            mapping[source] = target
-
-    for source, target in load_frontend_hardcoded_replacements(lang_code):
-        if is_online_dom_translation_entry(source, target):
-            mapping[source] = target
-
-    return dict(sorted(mapping.items()))
-
-
-def build_online_dom_translation_script(lang_code: str, mapping: dict[str, str]) -> str:
-    mapping_json = json.dumps(mapping, ensure_ascii=False, separators=(",", ":"))
-    if lang_code == "zh-CN":
-        selected_text = "已选择 $1 项"
-        delete_selected_text = "删除 $1 个所选项目"
-    else:
-        selected_text = "已選擇 $1 項"
-        delete_selected_text = "刪除 $1 個所選項目"
-    dynamic_rules = "".join((
-        f'[/^(\\d+) selected$/,"{selected_text}"],'
-        f'[/^Delete (\\d+) selected item$/,"{delete_selected_text}"],'
-        f'[/^Delete (\\d+) selected items$/,"{delete_selected_text}"],'
-        '[/^Mon$/,"周一"],[/^Tue$/,"周二"],[/^Wed$/,"周三"],[/^Thu$/,"周四"],'
-        '[/^Fri$/,"周五"],[/^Sat$/,"周六"],[/^Sun$/,"周日"]'
-    ))
-    return (
-        "(()=>{try{"
-        f'const L="{lang_code}",M={mapping_json};'
-        'localStorage.setItem("spa:locale",L);'
-        'document.documentElement&&document.documentElement.setAttribute("lang",L);'
-        'const N=s=>(s||"").replace(/\\s+/g," ").trim();'
-        'const G=[[/^Morning, (.+)$/,"早上好，$1"],[/^Good morning, (.+)$/,"早上好，$1"],'
-        '[/^Afternoon, (.+)$/,"下午好，$1"],[/^Good afternoon, (.+)$/,"下午好，$1"],'
-        '[/^Evening, (.+)$/,"晚上好，$1"],[/^Good evening, (.+)$/,"晚上好，$1"],'
-        '[/^It\\\'s late-night (.+)$/,"夜深了，$1"],[/^Good night, (.+)$/,"晚安，$1"],'
-        '[/^Delete (\\d+) chat$/,"删除 $1 个聊天"],[/^Delete (\\d+) chats$/,"删除 $1 个聊天"],'
-        '[/^Move (\\d+) chat to a project$/,"将 $1 个聊天移至项目"],[/^Move (\\d+) chats to a project$/,"将 $1 个聊天移至项目"],'
-        '[/^Connection needs (\\d+) field$/,"连接还需要填写 $1 个字段"],[/^Connection needs (\\d+) fields$/,"连接还需要填写 $1 个字段"],'
-        '[/^needs (\\d+) field$/,"还需要填写 $1 个字段"],[/^needs (\\d+) fields$/,"还需要填写 $1 个字段"],'
-        '[/^Are you sure you want to delete (\\d+) chat\\? This cannot be undone\\.$/,"你确定要删除 $1 个聊天吗？此操作无法撤消。"],'
-        '[/^Are you sure you want to delete (\\d+) chats\\? This cannot be undone\\.$/,"你确定要删除 $1 个聊天吗？此操作无法撤消。"],'
-        '[/^Are you sure you want to permanently delete this chat\\? This cannot be undone\\.$/,"你确定要永久删除此聊天吗？此操作无法撤消。"],'
-        '[/^Are you sure you want to permanently delete these chats\\? This cannot be undone\\.$/,"你确定要永久删除这些聊天吗？此操作无法撤消。"],'
-        f'{dynamic_rules}];'
-        'const R=s=>{const n=N(s);if(M[n])return M[n];for(const [r,t] of G){const m=n.match(r);'
-        'if(m)return t.replace("$1",m[1])}};'
-        'const X=new Set(["SCRIPT","STYLE","NOSCRIPT"]);'
-        "function T(){"
-        "try{"
-        "const b=document.body||document.documentElement;if(!b)return;"
-        "const w=document.createTreeWalker(b,NodeFilter.SHOW_TEXT,{acceptNode(n){"
-        "const p=n.parentElement;if(!p||X.has(p.tagName)||p.closest('[contenteditable]')||!R(n.nodeValue))return NodeFilter.FILTER_REJECT;"
-        "return NodeFilter.FILTER_ACCEPT}});"
-        "let n;while(n=w.nextNode()){const v=R(n.nodeValue);if(v)n.nodeValue=v}"
-        'document.querySelectorAll("[aria-label],[title],[placeholder],input,textarea").forEach(e=>{'
-        '["aria-label","title","placeholder","value"].forEach(a=>{'
-        'try{if(a==="value"&&!(e.matches("input[type=button],input[type=submit]")))return;'
-        "let v=e.getAttribute?e.getAttribute(a):void 0;if(v==null&&a in e)v=e[a];const t=R(v);"
-        "if(t){if(e.setAttribute)e.setAttribute(a,t);try{if(a in e)e[a]=t}catch{}}}catch{}})});"
-        'document.querySelectorAll("a").forEach(e=>{try{'
-        'const r=e.getBoundingClientRect(),txt=N(e.textContent);'
-        'if(txt==="Claude"&&r.left<100&&r.top<100)e.style.visibility="hidden"}catch{}});'
-        "}catch{}}"
-        "T();"
-        "new MutationObserver(()=>{clearTimeout(window.__claudeZhDomTimer);window.__claudeZhDomTimer=setTimeout(T,30)})"
-        ".observe(document.documentElement,{subtree:true,childList:true,characterData:true,attributes:true});"
-        "}catch(e){}})()"
-    )
-
-
-def build_online_locale_main_process_script(
-    lang_code: str,
-    mapping: dict[str, str],
-    web_contents_expr: str,
-    existing_dom_ready_body: str,
-) -> str:
-    script = (
-        f'(()=>{{try{{const l="{lang_code}";'
-        'if(localStorage.getItem("spa:locale")!==l){localStorage.setItem("spa:locale",l)}}catch(e){}})();'
-        + build_online_dom_translation_script(lang_code, mapping)
-    )
-    return (
-        f'{web_contents_expr}.on("dom-ready",()=>{{{existing_dom_ready_body};'
-        f"{web_contents_expr}.executeJavaScript({json.dumps(script)}).catch(()=>{{}})"
-        f"}});/*{ONLINE_LOCALE_MAIN_MARKER}*/"
-    )
-
-
-def strip_online_locale_main_process_patch(text: str) -> tuple[str, bool]:
-    pattern = re.compile(
-        r'(?P<web_contents>[A-Za-z_$][A-Za-z0-9_$]*\.webContents)'
-        r'\.on\("dom-ready",\(\)=>\{'
-        r'(?P<body>.*?);'
-        r'(?P=web_contents)\.executeJavaScript\("(?:\\.|[^"])*"\)\.catch\(\(\)=>\{\}\)'
-        rf'\}}\);/\*{ONLINE_LOCALE_MAIN_MARKER}\*/'
-    )
-
-    def restore(match: re.Match[str]) -> str:
-        web_contents = match.group("web_contents")
-        body = match.group("body")
-        return f'{web_contents}.on("dom-ready",()=>{{{body}}});'
-
-    patched, count = pattern.subn(restore, text)
-    return patched, count > 0
-
-
-def find_main_view_dom_ready_handler(text: str) -> re.Match[str] | None:
-    pattern = re.compile(
-        r'(?P<web_contents>[A-Za-z_$][A-Za-z0-9_$]*\.webContents)'
-        r'\.on\("dom-ready",\(\)=>\{(?P<body>[^{}]*)\}\);'
-    )
-    matches = [
-        match
-        for match in pattern.finditer(text)
-        if ".vite/build/mainView.js" in text[max(0, match.start() - 2500) : match.start()]
-    ]
-    if len(matches) > 1:
-        raise SystemExit("Could not patch online locale main-process hook: multiple main view dom-ready handlers found.")
-    if matches:
-        return matches[0]
-    return pattern.search(text)
-
-
-def patch_online_locale_main_process(app: Path, lang_code: str) -> None:
-    path = app / APP_ASAR_REL
-    require_file(path)
-
-    data = path.read_bytes()
-    header_size, _header_string, header = read_asar_header(data, path)
-    entry = get_asar_file_entry(header, ASAR_PATCH_TARGET)
-    content_offset = 8 + header_size + int(entry["offset"])
-    content_size = int(entry["size"])
-    content_end = content_offset + content_size
-    if content_offset < 0 or content_end > len(data):
-        raise SystemExit(f"Unsupported app.asar file bounds for {ASAR_PATCH_TARGET}.")
-
-    text = data[content_offset:content_end].decode("utf-8")
-    text, had_existing = strip_online_locale_main_process_patch(text)
-    mapping = build_online_translation_map(app, lang_code)
-    handler = find_main_view_dom_ready_handler(text)
-    if handler is None:
-        if had_existing:
-            raise SystemExit("Could not refresh online locale main-process patch.")
-        raise SystemExit("Could not find main view dom-ready anchor for online locale patch.")
-
-    injection = build_online_locale_main_process_script(
-        lang_code,
-        mapping,
-        handler.group("web_contents"),
-        handler.group("body"),
-    )
-    if injection in text:
-        print("Online claude.ai locale main-process patch already applied")
-        return
-
-    patched = (text[: handler.start()] + injection + text[handler.end() :]).encode("utf-8")
-    replace_asar_file_content(app, ASAR_PATCH_TARGET, patched)
-    action = "Refreshed" if had_existing else "Patched"
-    print(f"{action} online claude.ai locale main-process hook: {len(mapping)} DOM strings")
-
-
-def _custom3p_validation_removed(content: bytes) -> bool:
-    return (
-        b"expected a gateway model route referencing an Anthropic model" not in content
-        and b"Bedrock model" not in content
-    )
-
-
-def find_custom3p_validation_toggle(content: bytes, expr: bytes) -> re.Match[bytes] | None:
-    pattern = re.compile(
-        rb"const ([A-Za-z_$][A-Za-z0-9_$]*)="
-        + re.escape(expr)
-        + rb"\|\|!1,([A-Za-z_$][A-Za-z0-9_$]*)="
-    )
-    matches: list[re.Match[bytes]] = []
-    for match in pattern.finditer(content):
-        flag_name = match.group(1)
-        validation_window = content[match.start() : match.start() + 2500]
-        if (
-            b"if(!" + flag_name + b")return{ok:!0}" in validation_window
-            and b"expected a gateway model route referencing an Anthropic model" in validation_window
-            and b"Bedrock model" in validation_window
-        ):
-            matches.append(match)
-
-    if len(matches) > 1:
-        raise SystemExit("Could not patch custom 3P model validation: multiple matching toggles found.")
-    return matches[0] if matches else None
-
-
-def find_custom3p_name_validator(content: bytes, *, patched: bool) -> re.Match[bytes] | None:
-    pattern = re.compile(
-        rb"function ([A-Za-z_$][A-Za-z0-9_$]*)\(([A-Za-z_$][A-Za-z0-9_$]*)\)"
-        rb"\{const ([A-Za-z_$][A-Za-z0-9_$]*)=\2\.toLowerCase\(\);return ([^{};]+)\}"
-    )
-    matches: list[re.Match[bytes]] = []
-    for match in pattern.finditer(content):
-        expr = match.group(4).strip()
-        validation_window = content[max(0, match.start() - 1500) : match.start() + 3000]
-        if (
-            b"deepseek" in validation_window
-            and b"expected a gateway model route referencing an Anthropic model" in validation_window
-        ):
-            if patched and expr == b"!0":
-                matches.append(match)
-            elif (
-                not patched
-                and b".test(" in match.group(4)
-                and b".some(" in match.group(4)
-                and b".includes(" in match.group(4)
-            ):
-                matches.append(match)
-
-    if len(matches) > 1:
-        raise SystemExit("Could not patch custom 3P model validation: multiple matching validators found.")
-    return matches[0] if matches else None
-
-
-def patch_custom3p_name_validator(content: bytes) -> bytes | None:
-    match = find_custom3p_name_validator(content, patched=False)
-    if match is None:
-        return None
-
-    expr = match.group(4)
-    replacement = b"!0" + b" " * (len(expr) - len(b"!0"))
-    if len(expr) != len(replacement):
-        raise SystemExit("Internal patch error: custom 3P validator replacement changed length.")
-    return content[: match.start(4)] + replacement + content[match.end(4) :]
-
-
-def update_electron_asar_integrity(app: Path, header_string: str) -> None:
-    info_plist = app / "Contents/Info.plist"
-    require_file(info_plist)
-    with info_plist.open("rb") as f:
-        info = plistlib.load(f)
-
-    integrity = info.get("ElectronAsarIntegrity")
-    if not isinstance(integrity, dict):
-        raise SystemExit("Info.plist is missing ElectronAsarIntegrity.")
-    app_asar = integrity.get("Resources/app.asar")
-    if not isinstance(app_asar, dict) or app_asar.get("algorithm") != "SHA256":
-        raise SystemExit("Info.plist has unsupported ElectronAsarIntegrity format.")
-
-    app_asar["hash"] = hashlib.sha256(header_string.encode("utf-8")).hexdigest()
-    tmp = info_plist.with_suffix(info_plist.suffix + ".tmp")
-    with tmp.open("wb") as f:
-        plistlib.dump(info, f, fmt=plistlib.FMT_XML)
-    os.replace(tmp, info_plist)
-
-
-def patch_custom3p_model_validation(app: Path) -> None:
-    path = app / APP_ASAR_REL
-    require_file(path)
-
-    old_expr = b'process.env.NODE_ENV!=="production"'
-    new_expr = b"false"
-    replacement = new_expr + b" " * (len(old_expr) - len(new_expr))
-
-    data = bytearray(path.read_bytes())
-    header_size, _header_string, header = read_asar_header(data, path)
-    entry = get_asar_file_entry(header, ASAR_PATCH_TARGET)
-    content_offset = 8 + header_size + int(entry["offset"])
-    content_size = int(entry["size"])
-    content_end = content_offset + content_size
-    if content_offset < 0 or content_end > len(data):
-        raise SystemExit(f"Unsupported app.asar file bounds for {ASAR_PATCH_TARGET}.")
-
-    content = bytes(data[content_offset:content_end])
-    match = find_custom3p_validation_toggle(content, old_expr)
-    if match is None:
-        patched_match = find_custom3p_validation_toggle(content, replacement)
-        if patched_match is not None:
-            print("Custom 3P model-name validation already patched in app.asar")
-            return
-        if find_custom3p_name_validator(content, patched=True) is not None:
-            print("Custom 3P model-name validation already patched in app.asar")
-            return
-        patched_content = patch_custom3p_name_validator(content)
-        if patched_content is None:
-            if _custom3p_validation_removed(content):
-                print("Custom 3P model-name validation not present (removed in this Claude version)")
-                return
-            raise SystemExit(
-                "Could not patch custom 3P model validation. Claude bundle format may have changed."
-            )
-    else:
-        anchor = match.group(0)
-        patched = (
-            b"const "
-            + match.group(1)
-            + b"="
-            + replacement
-            + b"||!1,"
-            + match.group(2)
-            + b"="
-        )
-        if len(anchor) != len(patched):
-            raise SystemExit("Internal patch error: custom 3P validation replacement changed length.")
-        patched_content = content[: match.start()] + patched + content[match.end() :]
-
-    if len(patched_content) != len(content):
-        raise SystemExit("Internal patch error: app.asar length changed during custom 3P patch.")
-    data[content_offset:content_end] = patched_content
-
-    entry["integrity"] = calculate_file_integrity(patched_content)
-    updated_header_string = json.dumps(header, ensure_ascii=False, separators=(",", ":"))
-    updated_header = encode_asar_header(updated_header_string, header_size)
-    data[: len(updated_header)] = updated_header
-
-    path.write_bytes(data)
-    update_electron_asar_integrity(app, updated_header_string)
-    print("Patched custom 3P model-name validation in app.asar")
-
-
-def pad_utf8_replacement(source: str, target: str) -> str:
-    source_len = len(source.encode("utf-8"))
-    target_len = len(target.encode("utf-8"))
-    if target_len > source_len:
-        raise SystemExit(f"Internal patch error: replacement is longer than source: {source}")
-    return target + (" " * (source_len - target_len))
-
-
-def get_main_process_menu_replacements(lang_code: str) -> dict[str, str]:
-    replacements_by_lang = {
-        "zh-CN": {
-            "File": "文件",
-            "Edit": "编辑",
-            "View": "查看",
-            "Developer": "开发者",
-            "Help": "帮助",
-            "Extensions": "扩展",
-            "Open Developer Config File…": "打开开发者配置文件…",
-            "Open Developer Config File...": "打开开发者配置文件...",
-            "Configure Third-Party Inference…": "配置第三方推理…",
-            "Configure Third-Party Inference...": "配置第三方推理...",
-            "Open App Config File…": "打开应用配置文件…",
-            "Open App Config File...": "打开应用配置文件...",
-            "Reload MCP Configuration": "重新加载 MCP 配置",
-            "Open MCP Log File": "打开 MCP 日志文件",
-            "Open MCP Log File…": "打开 MCP 日志文件…",
-            "Open MCP Log File...": "打开 MCP 日志文件...",
-            "Open Hardware Buddy…": "打开硬件伙伴…",
-            "Open Hardware Buddy...": "打开硬件伙伴...",
-            "Show All Dev Tools": "显示所有开发者工具",
-            "Show Dev Tools": "显示开发者工具",
-            "Enable Main Process Debugger": "启用主进程调试器",
-            "Record Performance Trace": "记录性能跟踪",
-            "Write Main Process Heap Snapshot": "写入主进程堆快照",
-            "Record Memory Trace (auto-stop)": "记录内存跟踪 (自动)",
-        },
-        "zh-TW": {
-            "File": "檔案",
-            "Edit": "編輯",
-            "View": "檢視",
-            "Developer": "開發者",
-            "Help": "說明",
-            "Extensions": "擴充功能",
-            "Open Developer Config File…": "開啟開發者設定檔…",
-            "Open Developer Config File...": "開啟開發者設定檔...",
-            "Configure Third-Party Inference…": "設定第三方推理…",
-            "Configure Third-Party Inference...": "設定第三方推理...",
-            "Open App Config File…": "開啟應用程式設定檔…",
-            "Open App Config File...": "開啟應用程式設定檔...",
-            "Reload MCP Configuration": "重新載入 MCP 設定",
-            "Open MCP Log File": "開啟 MCP 記錄檔",
-            "Open MCP Log File…": "開啟 MCP 記錄檔…",
-            "Open MCP Log File...": "開啟 MCP 記錄檔...",
-            "Open Hardware Buddy…": "開啟硬體夥伴…",
-            "Open Hardware Buddy...": "開啟硬體夥伴...",
-            "Show All Dev Tools": "顯示所有開發者工具",
-            "Show Dev Tools": "顯示開發者工具",
-            "Enable Main Process Debugger": "啟用主行程偵錯器",
-            "Record Performance Trace": "記錄效能追蹤",
-            "Write Main Process Heap Snapshot": "寫入主行程堆積快照",
-            "Record Memory Trace (auto-stop)": "記錄記憶體追蹤 (自動)",
-        },
-        "zh-HK": {
-            "File": "檔案",
-            "Edit": "編輯",
-            "View": "檢視",
-            "Developer": "開發者",
-            "Help": "說明",
-            "Extensions": "擴充功能",
-            "Open Developer Config File…": "開啟開發者設定檔…",
-            "Open Developer Config File...": "開啟開發者設定檔...",
-            "Configure Third-Party Inference…": "設定第三方推理…",
-            "Configure Third-Party Inference...": "設定第三方推理...",
-            "Open App Config File…": "開啟應用程式設定檔…",
-            "Open App Config File...": "開啟應用程式設定檔...",
-            "Reload MCP Configuration": "重新載入 MCP 設定",
-            "Open MCP Log File": "開啟 MCP 記錄檔",
-            "Open MCP Log File…": "開啟 MCP 記錄檔…",
-            "Open MCP Log File...": "開啟 MCP 記錄檔...",
-            "Open Hardware Buddy…": "開啟硬件夥伴…",
-            "Open Hardware Buddy...": "開啟硬件夥伴...",
-            "Show All Dev Tools": "顯示所有開發者工具",
-            "Show Dev Tools": "顯示開發者工具",
-            "Enable Main Process Debugger": "啟用主行程偵錯器",
-            "Record Performance Trace": "記錄效能追蹤",
-            "Write Main Process Heap Snapshot": "寫入主行程堆積快照",
-            "Record Memory Trace (auto-stop)": "記錄記憶體追蹤 (自動)",
-        },
-    }
-    return replacements_by_lang[lang_code]
-
-
-def get_main_process_menu_intl_replacements(lang_code: str) -> dict[str, str]:
-    replacements_by_lang = {
-        "zh-CN": {
-            "0tZLEYF8mJ": "开发者",
-            "/PgA81GVOD": "编辑",
-            "LCWUQ/4Fu6": "查看",
-            "uc3dnSo+eo": "文件",
-            "EfdnINFnIz": "文件",
-            "pWXxZASpOB": "帮助",
-            "JOf7G+dCf1": "打开应用配置文件...",
-            "K5GtyaPaw/": "打开开发者配置文件...",
-            "RTg057HE1D": "显示开发者工具",
-            "STqYpFr7p4": "显示所有开发者工具",
-            "rNAd+HxSK4": "打开 MCP 日志文件",
-            "PW5U8NgTto": "打开 MCP 日志文件...",
-            "uKCcuVd1Yt": "重新加载 MCP 配置",
-            "9GRz7bC+rr": "配置第三方推理…",
-        },
-        "zh-TW": {
-            "0tZLEYF8mJ": "開發者",
-            "/PgA81GVOD": "編輯",
-            "LCWUQ/4Fu6": "檢視",
-            "uc3dnSo+eo": "檔案",
-            "EfdnINFnIz": "檔案",
-            "pWXxZASpOB": "說明",
-            "JOf7G+dCf1": "開啟應用程式設定檔...",
-            "K5GtyaPaw/": "開啟開發者設定檔...",
-            "RTg057HE1D": "顯示開發者工具",
-            "STqYpFr7p4": "顯示所有開發者工具",
-            "rNAd+HxSK4": "開啟 MCP 記錄檔",
-            "PW5U8NgTto": "開啟 MCP 記錄檔...",
-            "uKCcuVd1Yt": "重新載入 MCP 設定",
-            "9GRz7bC+rr": "設定第三方推理…",
-        },
-        "zh-HK": {
-            "0tZLEYF8mJ": "開發者",
-            "/PgA81GVOD": "編輯",
-            "LCWUQ/4Fu6": "檢視",
-            "uc3dnSo+eo": "檔案",
-            "EfdnINFnIz": "檔案",
-            "pWXxZASpOB": "說明",
-            "JOf7G+dCf1": "開啟應用程式設定檔...",
-            "K5GtyaPaw/": "開啟開發者設定檔...",
-            "RTg057HE1D": "顯示開發者工具",
-            "STqYpFr7p4": "顯示所有開發者工具",
-            "rNAd+HxSK4": "開啟 MCP 記錄檔",
-            "PW5U8NgTto": "開啟 MCP 記錄檔...",
-            "uKCcuVd1Yt": "重新載入 MCP 設定",
-            "9GRz7bC+rr": "設定第三方推理…",
-        },
-    }
-    return replacements_by_lang[lang_code]
-
-
-def replace_menu_intl_message_by_id(text: str, message_id: str, target: str) -> tuple[str, int]:
-    updated = text
-    count = 0
-    needle = f'id:"{message_id}"'
-    pattern = re.compile(
-        r'[A-Za-z_$][A-Za-z0-9_$]*\(\)\.formatMessage\(\{defaultMessage:"(?:\\.|[^"\\])*",id:"'
-        + re.escape(message_id)
-        + r'"(?:,description:"(?:\\.|[^"\\])*")?\}\)'
-    )
-    search_start = 0
-    while True:
-        id_index = updated.find(needle, search_start)
-        if id_index < 0:
-            break
-
-        window_start = max(0, id_index - 600)
-        window_end = min(len(updated), id_index + 600)
-        match = pattern.search(updated[window_start:window_end])
-        if not match:
-            search_start = id_index + len(needle)
-            continue
-
-        absolute_start = window_start + match.start()
-        absolute_end = window_start + match.end()
-        literal = json.dumps(target, ensure_ascii=False)
-        updated = updated[:absolute_start] + literal + updated[absolute_end:]
-        count += 1
-        search_start = absolute_start + len(literal)
-
-    return updated, count
-
-
-def replace_menu_literal_length_preserving(text: str, source: str, target: str) -> tuple[str, int]:
-    pattern = re.compile(
-        r"(?P<prefix>(?<![A-Za-z0-9_$])(?:label|defaultMessage)\s*:\s*)"
-        r'(?P<quote>["\'`])'
-        + re.escape(source)
-        + r"(?P=quote)"
-    )
-
-    def replace_match(match: re.Match[str]) -> str:
-        original = match.group(0)
-        quote = match.group("quote")
-        replacement = f"{match.group('prefix')}{quote}{target}{quote}"
-        byte_delta = len(original.encode("utf-8")) - len(replacement.encode("utf-8"))
-        if byte_delta < 0:
-            return original
-        return replacement + (" " * byte_delta)
-
-    return pattern.subn(replace_match, text)
-
-
-def patch_length_preserving_main_process_menu_labels(app: Path, lang_code: str) -> None:
-    path = app / APP_ASAR_REL
-    require_file(path)
-    replacements = get_main_process_menu_replacements(lang_code)
-
-    data = bytearray(path.read_bytes())
-    header_size, _header_string, header = read_asar_header(data, path)
-    entry = get_asar_file_entry(header, ASAR_PATCH_TARGET)
-    content_offset = 8 + header_size + int(entry["offset"])
-    content_size = int(entry["size"])
-    content_end = content_offset + content_size
-    if content_offset < 0 or content_end > len(data):
-        raise SystemExit(f"Unsupported app.asar file bounds for {ASAR_PATCH_TARGET}.")
-
-    content = bytes(data[content_offset:content_end])
-    text = content.decode("utf-8")
-    patched = text
-    count = 0
-    for source, target in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
-        patched, occurrences = replace_menu_literal_length_preserving(patched, source, target)
-        count += occurrences
-
-    patched_content = patched.encode("utf-8")
-    if patched_content == content:
-        print("Length-preserving main-process menu labels already patched")
-        return
-    if len(patched_content) != len(content):
-        raise SystemExit("Internal patch error: length-preserving menu patch changed app.asar content length.")
-
-    data[content_offset:content_end] = patched_content
-    entry["integrity"] = calculate_file_integrity(patched_content)
-    updated_header_string = json.dumps(header, ensure_ascii=False, separators=(",", ":"))
-    updated_header = encode_asar_header(updated_header_string, header_size)
-    data[: len(updated_header)] = updated_header
-    path.write_bytes(data)
-    update_electron_asar_integrity(app, updated_header_string)
-    print(f"Patched length-preserving main-process menu labels: {count} replacements")
-
-
-def patch_hardcoded_main_process_menu_labels(app: Path, lang_code: str) -> None:
-    path = app / APP_ASAR_REL
-    require_file(path)
-    replacements = get_main_process_menu_replacements(lang_code)
-
-    data = bytearray(path.read_bytes())
-    header_size, _header_string, header = read_asar_header(data, path)
-    entry = get_asar_file_entry(header, ASAR_PATCH_TARGET)
-    content_offset = 8 + header_size + int(entry["offset"])
-    content_size = int(entry["size"])
-    content_end = content_offset + content_size
-    if content_offset < 0 or content_end > len(data):
-        raise SystemExit(f"Unsupported app.asar file bounds for {ASAR_PATCH_TARGET}.")
-
-    content = bytes(data[content_offset:content_end])
-    text = content.decode("utf-8")
-    patched = text
-    count = 0
-    intl_count = 0
-    repair_count = 0
-    unsafe_repairs = {
-        "文件": "File",
-        "檔案": "File",
-        "编辑": "Edit",
-        "編輯": "Edit",
-        "查看": "View",
-        "檢視": "View",
-        "帮助": "Help",
-        "說明": "Help",
-        "开发者": "Developer",
-        "開發者": "Developer",
-        "扩展": "Extensions",
-        "擴充功能": "Extensions",
-    }
-    for source, target in unsafe_repairs.items():
-        pattern = re.compile(r'(?P<quote>["\'`])' + re.escape(source) + r"(?P=quote)")
-
-        def repair_match(match: re.Match[str]) -> str:
-            quote = match.group("quote")
-            return f"{quote}{target}{quote}"
-
-        patched, occurrences = pattern.subn(repair_match, patched)
-        repair_count += occurrences
-
-    for message_id, target in get_main_process_menu_intl_replacements(lang_code).items():
-        patched, occurrences = replace_menu_intl_message_by_id(patched, message_id, target)
-        intl_count += occurrences
-
-    for source, target in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
-        if source not in patched:
-            continue
-        pattern = re.compile(
-            r"(?P<prefix>(?<![A-Za-z0-9_$])(?:label|defaultMessage)\s*:\s*)"
-            r'(?P<quote>["\'`])'
-            + re.escape(source)
-            + r"(?P=quote)"
-        )
-
-        def replace_match(match: re.Match[str]) -> str:
-            quote = match.group("quote")
-            return f"{match.group('prefix')}{quote}{target}{quote}"
-
-        patched, occurrences = pattern.subn(replace_match, patched)
-        count += occurrences
-
-    if count == 0 and intl_count == 0 and repair_count == 0:
-        print("Hardcoded main-process menu labels already patched")
-        return
-
-    patched_content = patched.encode("utf-8")
-    replace_asar_file_content(app, ASAR_PATCH_TARGET, patched_content)
-    if repair_count:
-        print(f"Repaired unsafe short main-process menu replacements: {repair_count} occurrences")
-    print(f"Patched hardcoded main-process menu labels: {count + intl_count} replacements")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def merge_frontend_locale(app: Path, lang_code: str) -> tuple[int, int, int]:
@@ -1202,9 +1082,44 @@ def install_statsig_locale(app: Path, lang_code: str) -> None:
     print(f"Installed statsig {lang_code} resource")
 
 
-def sign_path(path: Path, entitlements_dir: Path) -> None:
+def install_dynamic_locale(app: Path, lang_code: str) -> None:
+    dynamic_dir = app / FRONTEND_I18N_REL / "dynamic"
+    source = dynamic_dir / "en-US.json"
+    if not source.exists():
+        # Claude < 2.9939.2 没有 dynamic 目录，无需处理。
+        return
+    # 2.9939.2 起 dynamic catalog 与主语言包一起强制加载（fetch 非 2xx 直接抛错），
+    # 缺失会让整个 zh 语言包加载失败并回退英文。有随包中文 dynamic 词表时优先使用，
+    # 否则按官方 en-US 原文兜底，保证加载不失败。
+    localized = RESOURCES / f"dynamic-{lang_code}.json"
+    shutil.copy2(localized if localized.exists() else source, dynamic_dir / f"{lang_code}.json")
+    print(f"Installed frontend dynamic {lang_code} resource")
+
+
+def app_bundle_identifier(app: Path) -> str | None:
+    """Return CFBundleIdentifier of *app*, or None when it cannot be read."""
+    info_plist = app / "Contents/Info.plist"
+    try:
+        with info_plist.open("rb") as f:
+            plist = plistlib.load(f)
+        value = plist.get("CFBundleIdentifier")
+        return value if isinstance(value, str) and value else None
+    except Exception:
+        return None
+
+
+def sign_path(
+    path: Path,
+    entitlements_dir: Path,
+    *,
+    hardened_runtime: bool = True,
+    force_get_task_allow: bool = False,
+    designated_requirement: str | None = None,
+) -> None:
     entitlements = load_entitlements(path)
-    if entitlements:
+    if entitlements is None:
+        entitlements = {}
+    if entitlements or force_get_task_allow:
         entitlements.pop("com.apple.application-identifier", None)
         entitlements.pop("com.apple.developer.team-identifier", None)
         entitlements.pop("keychain-access-groups", None)
@@ -1212,20 +1127,26 @@ def sign_path(path: Path, entitlements_dir: Path) -> None:
         # Electron's main process otherwise fails library validation when it loads
         # bundled frameworks, even when the whole bundle is signed consistently.
         entitlements["com.apple.security.cs.disable-library-validation"] = True
+        if force_get_task_allow:
+            # Required for Frida/task_for_pid against this process under SIP.
+            entitlements["com.apple.security.get-task-allow"] = True
+            entitlements.setdefault("com.apple.security.cs.allow-jit", True)
 
     cmd = [
         "codesign",
         "--force",
         "--sign",
         "-",
-        "--options",
-        "runtime",
-        "--preserve-metadata=identifier,flags",
+        "--timestamp=none",
     ]
+    if hardened_runtime:
+        cmd.extend(["--options", "runtime", "--preserve-metadata=identifier,flags"])
     if entitlements:
         entitlement_path = entitlements_dir / f"{abs(hash(path.as_posix()))}.plist"
         entitlement_path.write_bytes(plistlib.dumps(entitlements, fmt=plistlib.FMT_XML))
         cmd.extend(["--entitlements", str(entitlement_path)])
+    if designated_requirement:
+        cmd.extend(["-r", f"=designated => {designated_requirement}"])
     cmd.append(str(path))
 
     result = run(cmd, check=False)
@@ -1242,14 +1163,10 @@ def is_signable_file(path: Path) -> bool:
     return os.access(path, os.X_OK)
 
 
-def resign_app(app: Path) -> None:
-    start = time.perf_counter()
-    log("Re-signing patched app with local ad-hoc signature, preserving entitlements")
+def _collect_sign_targets(app: Path) -> tuple[list[Path], list[Path]]:
     contents = app / "Contents"
-    entitlements_dir = Path(tempfile.mkdtemp(prefix="claude-zh-cn-entitlements."))
     bundle_targets: list[Path] = []
     file_targets: list[Path] = []
-
     for root, dirs, files in os.walk(contents):
         root_path = Path(root)
         for dirname in dirs:
@@ -1260,6 +1177,14 @@ def resign_app(app: Path) -> None:
             path = root_path / filename
             if is_signable_file(path):
                 file_targets.append(path)
+    return file_targets, bundle_targets
+
+
+def resign_app(app: Path) -> None:
+    start = time.perf_counter()
+    log("Re-signing patched app with local ad-hoc signature, preserving entitlements")
+    entitlements_dir = Path(tempfile.mkdtemp(prefix="claude-zh-cn-entitlements."))
+    file_targets, bundle_targets = _collect_sign_targets(app)
 
     # Sign nested Mach-O files first, then their containing bundles, then the outer app.
     log(f"  signing {len(file_targets)} executable files and {len(bundle_targets) + 1} bundles")
@@ -1273,8 +1198,47 @@ def resign_app(app: Path) -> None:
         sign_path(path, entitlements_dir)
         if index % 10 == 0 or index == len(sorted_bundle_targets):
             log(f"  signed {index}/{len(sorted_bundle_targets)} nested bundles ({elapsed_since(start)})")
-    sign_path(app, entitlements_dir)
+    # ShipIt validates downloaded updates against the installed app's designated
+    # requirement. The ad-hoc default DR is a cdhash pin that no official update
+    # can satisfy, which is why patched apps silently never install updates.
+    # An identifier-only DR is satisfied by any official Claude release, so
+    # auto-update keeps working (the update replaces the patch with the
+    # official app; re-run the patch afterwards).
+    bundle_id = app_bundle_identifier(app)
+    if bundle_id:
+        sign_path(app, entitlements_dir, designated_requirement=f'identifier "{bundle_id}"')
+    else:
+        log("  warning: CFBundleIdentifier not found; keeping default ad-hoc DR (auto-update will not install)")
+        sign_path(app, entitlements_dir)
     log(f"Re-signed patched app in {elapsed_since(start)}")
+
+
+def codesign_info(app: Path) -> dict[str, Any]:
+    """Return a small codesign summary for *app* (best-effort)."""
+    result = run(["codesign", "-dv", "--verbose=4", str(app)], check=False)
+    text = (result.stdout or "") + (result.stderr or "")
+    flags = ""
+    for line in text.splitlines():
+        if "flags=" in line:
+            flags = line.split("flags=", 1)[-1].strip()
+            break
+    entitlements = load_entitlements(app) or {}
+    return {
+        "flags": flags,
+        "adhoc": "adhoc" in flags or "Signature=adhoc" in text or "Signature=adhoc" in (result.stderr or ""),
+        "hardened_runtime": "runtime" in flags,
+        "get_task_allow": bool(entitlements.get("com.apple.security.get-task-allow")),
+        "entitlements": entitlements,
+        "raw": text,
+    }
+
+
+
+
+
+
+
+
 
 
 def clear_quarantine(app: Path) -> None:
@@ -1284,24 +1248,45 @@ def clear_quarantine(app: Path) -> None:
 
 
 def set_user_locale(user_home: Path, lang_code: str) -> None:
-    config = user_home / "Library/Application Support/Claude/config.json"
-    config.parent.mkdir(parents=True, exist_ok=True)
-    data: dict[str, Any] = {}
-    if config.exists():
-        try:
-            data = load_json(config)
-        except Exception:
-            backup = config.with_suffix(".json.bak-invalid")
-            shutil.copy2(config, backup)
-            print(f"Existing config was not valid JSON; backed up to {backup}")
-    data["locale"] = lang_code
-    save_json(config, data)
-
+    """Write locale into Claude (+ Claude-3p if present) user config."""
+    targets = [
+        user_home / "Library/Application Support/Claude/config.json",
+        user_home / "Library/Application Support/Claude-3p/config.json",
+    ]
     sudo_uid = os.environ.get("SUDO_UID")
     sudo_gid = os.environ.get("SUDO_GID")
-    if sudo_uid and sudo_gid:
-        os.chown(config, int(sudo_uid), int(sudo_gid))
-    print(f"Set Claude config locale: {config}")
+    if not (sudo_uid and sudo_gid) and os.geteuid() == 0:
+        # macOS `do shell script ... with administrator privileges` does not
+        # provide SUDO_UID/GID; preserve the owner of the requested home.
+        owner = user_home.stat()
+        sudo_uid, sudo_gid = str(owner.st_uid), str(owner.st_gid)
+
+    for config in targets:
+        if config.name.startswith("Claude-3p") and not config.parent.exists():
+            continue
+        config.parent.mkdir(parents=True, exist_ok=True)
+        data: dict[str, Any] = {}
+        if config.exists():
+            try:
+                data = load_json(config)
+                if not isinstance(data, dict):
+                    data = {}
+            except Exception:
+                backup = config.with_suffix(".json.bak-invalid")
+                shutil.copy2(config, backup)
+                print(f"Existing config was not valid JSON; backed up to {backup}")
+                data = {}
+        if data.get("locale") == lang_code:
+            print(f"Claude config locale already {lang_code}: {config}")
+            continue
+        data["locale"] = lang_code
+        save_json(config, data)
+        os.chmod(config, 0o600)
+        if sudo_uid and sudo_gid:
+            os.chown(config, int(sudo_uid), int(sudo_gid))
+        print(f"Set Claude config locale: {config} -> {lang_code}")
+
+
 
 
 def chown_to_sudo_user(path: Path) -> None:
@@ -1340,29 +1325,38 @@ def ensure_config_library_entry(meta: dict[str, Any], config_id: str) -> None:
     entries.append({"id": config_id, "name": "Default"})
 
 
-def set_third_party_auto_updates(user_home: Path, enabled: bool, dry_run: bool = False) -> bool:
+def get_existing_third_party_config(user_home: Path, dry_run: bool = False) -> tuple[Path, Path, dict[str, Any]] | None:
     config_library = user_home / "Library/Application Support/Claude-3p/configLibrary"
     meta_path = config_library / "_meta.json"
-    creating_library = not meta_path.exists()
+    if not meta_path.exists():
+        return None
+
     meta = load_json_object_or_backup(meta_path, dry_run=dry_run)
     applied_id = meta.get("appliedId")
     config_id = str(applied_id) if isinstance(applied_id, str) and applied_id.strip() else ""
-
     if not config_id:
-        existing_configs = sorted(
-            path for path in config_library.glob("*.json") if path.name != "_meta.json"
-        )
-        config_id = existing_configs[0].stem if existing_configs else str(uuid.uuid4())
+        return None
 
     config_path = config_library / f"{config_id}.json"
+    if not config_path.exists():
+        return None
+
+    return meta_path, config_path, meta
+
+
+def set_third_party_config_auto_updates(user_home: Path, enabled: bool, dry_run: bool = False) -> bool:
+    existing = get_existing_third_party_config(user_home, dry_run=dry_run)
+    if existing is None:
+        return False
+
+    meta_path, config_path, meta = existing
     config = load_json_object_or_backup(config_path, dry_run=dry_run)
     config["disableAutoUpdates"] = not enabled
-    ensure_config_library_entry(meta, config_id)
+    ensure_config_library_entry(meta, config_path.stem)
 
     state = "允许" if enabled else "禁止"
     if dry_run:
-        action = "create and update" if creating_library else "update"
-        print(f"[dry-run] Would {action} Claude-3p config and {state}自动更新: {config_path}")
+        print(f"[dry-run] Would update Claude-3p config and {state}自动更新: {config_path}")
         return True
 
     save_json(config_path, config)
@@ -1371,6 +1365,308 @@ def set_third_party_auto_updates(user_home: Path, enabled: bool, dry_run: bool =
     chown_to_sudo_user(meta_path)
 
     print("允许更新成功" if enabled else "禁止更新成功")
+    return True
+
+
+def managed_preferences_user_name(user_home: Path) -> str:
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root":
+        return sudo_user
+    return user_home.name
+
+
+def set_macos_managed_auto_updates(user_home: Path, enabled: bool, dry_run: bool = False) -> bool:
+    user_name = managed_preferences_user_name(user_home)
+    plist_path = Path("/Library/Managed Preferences") / user_name / "com.anthropic.claudefordesktop.plist"
+    data: dict[str, Any] = {}
+    if plist_path.exists():
+        try:
+            with plist_path.open("rb") as f:
+                loaded = plistlib.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+            else:
+                raise ValueError("plist root is not a dictionary")
+        except Exception:
+            backup = plist_path.with_suffix(plist_path.suffix + ".bak-invalid")
+            if dry_run:
+                print(f"[dry-run] Existing managed plist is invalid; would back up to {backup}")
+            else:
+                shutil.copy2(plist_path, backup)
+
+    state = "允许" if enabled else "禁止"
+    plist_existed = plist_path.exists()
+    if enabled:
+        data.pop("disableAutoUpdates", None)
+    else:
+        data["disableAutoUpdates"] = True
+
+    if dry_run:
+        action = "remove disableAutoUpdates from" if enabled else "write disableAutoUpdates=true to"
+        print(f"[dry-run] Would {action} Claude Desktop managed policy and {state}自动更新: {plist_path}")
+        return True
+
+    if enabled and not plist_existed:
+        print("允许更新成功")
+        print(f"Claude Desktop managed policy was already absent: {plist_path}")
+        return True
+
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    with plist_path.open("wb") as f:
+        plistlib.dump(data, f, sort_keys=True)
+    os.chmod(plist_path, 0o644)
+    print("允许更新成功" if enabled else "禁止更新成功")
+    print(f"Updated Claude Desktop managed policy: {plist_path}")
+    return True
+
+
+def set_auto_updates(user_home: Path, enabled: bool, dry_run: bool = False) -> bool:
+    if set_third_party_config_auto_updates(user_home, enabled=enabled, dry_run=dry_run):
+        return True
+    return set_macos_managed_auto_updates(user_home, enabled=enabled, dry_run=dry_run)
+
+
+def read_skill_frontmatter(skill_md: Path) -> dict[str, str]:
+    text = skill_md.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+
+    end = None
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            end = index
+            break
+    if end is None:
+        return {}
+
+    data: dict[str, str] = {}
+    key = ""
+    value_lines: list[str] = []
+
+    def flush() -> None:
+        nonlocal key, value_lines
+        if key:
+            data[key] = "\n".join(line.strip() for line in value_lines).strip()
+        key = ""
+        value_lines = []
+
+    for raw_line in lines[1:end]:
+        if not raw_line.strip():
+            if key and value_lines:
+                value_lines.append("")
+            continue
+        if raw_line[:1].isspace():
+            if key:
+                value_lines.append(raw_line.strip())
+            continue
+        match = re.match(r"^([A-Za-z0-9_-]+):(?:\s*(.*))?$", raw_line)
+        if not match:
+            continue
+        flush()
+        key = match.group(1)
+        value = (match.group(2) or "").strip()
+        value_lines = [value] if value else []
+    flush()
+    return data
+
+
+def discover_cc_switch_skills(skills_dir: Path) -> list[dict[str, Any]]:
+    if not skills_dir.exists():
+        raise SystemExit(f"CC Switch skills directory not found: {skills_dir}")
+    if not skills_dir.is_dir():
+        raise SystemExit(f"CC Switch skills path is not a directory: {skills_dir}")
+
+    skills: list[dict[str, Any]] = []
+    for path in sorted(skills_dir.iterdir(), key=lambda item: item.name):
+        if not path.is_dir():
+            continue
+        skill_md = path / "SKILL.md"
+        if not skill_md.is_file():
+            continue
+        frontmatter = read_skill_frontmatter(skill_md)
+        name = frontmatter.get("name", "").strip() or path.name
+        if not name:
+            continue
+        if "/" in name or "\\" in name or name in {".", ".."}:
+            print(f"Invalid skill name, skipped: {name}")
+            continue
+        description = frontmatter.get("description", "").strip()
+        skills.append({"name": name, "description": description, "path": path})
+    return skills
+
+
+def find_claude_desktop_skills_plugin_root(user_home: Path) -> Path:
+    base = user_home / "Library/Application Support/Claude-3p/local-agent-mode-sessions/skills-plugin"
+    if not base.exists():
+        raise SystemExit(f"Claude Desktop skills-plugin directory not found: {base}")
+
+    candidates: list[Path] = []
+    for org_dir in sorted(base.iterdir(), key=lambda item: item.name):
+        if not org_dir.is_dir():
+            continue
+        for plugin_dir in sorted(org_dir.iterdir(), key=lambda item: item.name):
+            if (
+                plugin_dir.is_dir()
+                and (plugin_dir / "manifest.json").is_file()
+                and (plugin_dir / "skills").is_dir()
+            ):
+                candidates.append(plugin_dir)
+
+    if not candidates:
+        raise SystemExit(f"No Claude Desktop skills plugin root found under: {base}")
+    return max(candidates, key=lambda path: (path / "manifest.json").stat().st_mtime)
+
+
+def load_skills_manifest(manifest_path: Path, dry_run: bool = False) -> dict[str, Any]:
+    data = load_json_object_or_backup(manifest_path, dry_run=dry_run)
+    skills = data.get("skills")
+    if not isinstance(skills, list):
+        data["skills"] = []
+    return data
+
+
+def sync_cc_switch_skills(user_home: Path, skills_dir: Path, dry_run: bool = False) -> bool:
+    plugin_root = find_claude_desktop_skills_plugin_root(user_home)
+    desktop_skills_dir = plugin_root / "skills"
+    manifest_path = plugin_root / "manifest.json"
+    manifest = load_skills_manifest(manifest_path, dry_run=dry_run)
+    manifest_skills = manifest["skills"]
+    existing_manifest_names = {
+        str(item.get("name"))
+        for item in manifest_skills
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+
+    cc_skills = discover_cc_switch_skills(skills_dir)
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    added = 0
+    skipped = 0
+
+    print(f"Claude Desktop skills plugin: {plugin_root}")
+    print(f"CC Switch skills source: {skills_dir}")
+
+    for skill in cc_skills:
+        name = str(skill["name"])
+        source = Path(skill["path"])
+        target = desktop_skills_dir / name
+
+        if target.exists() or target.is_symlink() or name in existing_manifest_names:
+            print(f"已存在，跳过: {name}")
+            skipped += 1
+            continue
+
+        print(f"{'[dry-run] Would sync' if dry_run else '同步'}: {name} -> {source}")
+        if not dry_run:
+            os.symlink(source, target, target_is_directory=True)
+        manifest_skills.append(
+            {
+                "skillId": name,
+                "name": name,
+                "description": str(skill["description"]),
+                "creatorType": "user",
+                "syncManaged": False,
+                "updatedAt": now,
+                "enabled": True,
+            }
+        )
+        existing_manifest_names.add(name)
+        added += 1
+
+    if added:
+        manifest["lastUpdated"] = int(time.time() * 1000)
+        backup = manifest_path.with_name("manifest.json.bak-before-cc-switch-sync")
+        if dry_run:
+            print(f"[dry-run] Would back up manifest to: {backup}")
+            print(f"[dry-run] Would update manifest: {manifest_path}")
+        else:
+            shutil.copy2(manifest_path, backup)
+            chown_to_sudo_user(backup)
+            save_json(manifest_path, manifest)
+            chown_to_sudo_user(manifest_path)
+
+    print(f"同步完成：新增 {added} 个，跳过 {skipped} 个。")
+    if dry_run:
+        print("[dry-run] 未写入任何文件。")
+    return True
+
+
+def path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def unsync_cc_switch_skills(user_home: Path, skills_dir: Path, dry_run: bool = False) -> bool:
+    plugin_root = find_claude_desktop_skills_plugin_root(user_home)
+    desktop_skills_dir = plugin_root / "skills"
+    manifest_path = plugin_root / "manifest.json"
+    manifest = load_skills_manifest(manifest_path, dry_run=dry_run)
+    manifest_skills = manifest["skills"]
+    cc_skills = discover_cc_switch_skills(skills_dir)
+    cc_root = skills_dir.resolve()
+    removed_names: set[str] = set()
+    skipped = 0
+
+    print(f"Claude Desktop skills plugin: {plugin_root}")
+    print(f"CC Switch skills source: {skills_dir}")
+
+    for skill in cc_skills:
+        name = str(skill["name"])
+        target = desktop_skills_dir / name
+        if not target.is_symlink():
+            print(f"不是 CC Switch 同步软链接，跳过: {name}")
+            skipped += 1
+            continue
+
+        try:
+            resolved_target = target.resolve(strict=False)
+        except OSError:
+            print(f"无法解析软链接，跳过: {target}")
+            skipped += 1
+            continue
+
+        if not path_is_within(resolved_target, cc_root):
+            print(f"软链接目标不在 CC Switch skills 目录内，跳过: {name}")
+            skipped += 1
+            continue
+
+        print(f"{'[dry-run] Would remove sync' if dry_run else '删除同步'}: {name} -> {resolved_target}")
+        if not dry_run:
+            target.unlink()
+        removed_names.add(name)
+
+    if removed_names:
+        kept_skills = [
+            item
+            for item in manifest_skills
+            if not (
+                isinstance(item, dict)
+                and isinstance(item.get("name"), str)
+                and item.get("name") in removed_names
+            )
+        ]
+        removed_manifest_count = len(manifest_skills) - len(kept_skills)
+        manifest["skills"] = kept_skills
+        manifest["lastUpdated"] = int(time.time() * 1000)
+        backup = manifest_path.with_name("manifest.json.bak-before-cc-switch-sync")
+        if dry_run:
+            print(f"[dry-run] Would remove {removed_manifest_count} manifest entries")
+            print(f"[dry-run] Would back up manifest to: {backup}")
+            print(f"[dry-run] Would update manifest: {manifest_path}")
+        else:
+            shutil.copy2(manifest_path, backup)
+            chown_to_sudo_user(backup)
+            save_json(manifest_path, manifest)
+            chown_to_sudo_user(manifest_path)
+        print(f"取消同步完成：删除 {len(removed_names)} 个软链接，删除 {removed_manifest_count} 条 manifest 记录，跳过 {skipped} 个。")
+    else:
+        print(f"取消同步完成：删除 0 个，跳过 {skipped} 个。")
+
+    if dry_run:
+        print("[dry-run] 未写入任何文件。")
     return True
 
 
@@ -1402,20 +1698,94 @@ def find_app_backups(app: Path) -> list[Path]:
     return sorted(path for path in app.parent.glob(BACKUP_GLOB) if path.is_dir())
 
 
-def restore_oldest_backup(app: Path, dry_run: bool) -> Path:
+def bundle_version(app: Path) -> str:
+    """Return the app bundle version, or "0" when it cannot be read."""
+    info_plist = app / "Contents/Info.plist"
+    try:
+        with info_plist.open("rb") as f:
+            info = plistlib.load(f)
+    except Exception:
+        return "0"
+    for key in ("CFBundleShortVersionString", "CFBundleVersion"):
+        value = info.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return "0"
+
+
+def version_key(value: str) -> tuple[int, ...]:
+    """Numeric sort key for versions like "1.2" or "1.46388.3"."""
+    parts = [int(part) for part in re.findall(r"\d+", value)]
+    return tuple(parts + [0] * (3 - len(parts)))
+
+
+def _official_signature(info: dict[str, Any]) -> bool:
+    """Classify a codesign_info() result as an unpatched official build."""
+    if info.get("adhoc"):
+        return False
+    return "Authority=Developer ID Application" in info.get("raw", "")
+
+
+def is_officially_signed(app: Path) -> bool:
+    """True when *app* still carries its official Developer ID signature.
+
+    The patcher always re-signs with an ad-hoc signature, so a non-official
+    signature means the on-disk app was patched (or Frida-prepared) by this
+    toolchain and only a backup restore brings back clean official resources.
+    Anything unreadable counts as non-official to stay conservative.
+    """
+    try:
+        return _official_signature(codesign_info(app))
+    except Exception:
+        return False
+
+
+def preinstall_should_restore(app: Path) -> bool:
+    """True when the installed app needs a backup restore before re-patching.
+
+    Auto-update replaces the patched app with an official build, so an
+    officially signed install is never restored: restoring would downgrade
+    Claude to a stale backup and delete the fresh version (issue #156).
+    """
+    return not (app.exists() and is_officially_signed(app))
+
+
+def select_backup(backups: list[Path]) -> Path:
+    """Pick the backup with the highest bundled version (name as tie-breaker).
+
+    Restoring the oldest backup could downgrade Claude below the currently
+    installed version; the highest-version backup is the safest official
+    snapshot to fall back to.
+    """
+    return max(backups, key=lambda path: (version_key(bundle_version(path)), path.name))
+
+
+def prune_stale_backups(app: Path, keep: Path, dry_run: bool) -> None:
+    """Delete all zh-CN app backups except *keep*."""
+    for path in find_app_backups(app):
+        if path == keep:
+            continue
+        if dry_run:
+            print(f"[dry-run] Would delete stale backup: {path}")
+            continue
+        print(f"Deleting stale backup: {path}")
+        remove_path(path)
+
+
+def restore_backup(app: Path, dry_run: bool) -> Path:
     backups = find_app_backups(app)
     if not backups:
         raise SystemExit(f"No Claude backup found in {app.parent}: {BACKUP_GLOB}")
 
-    backup = backups[0]
-    extra_backups = backups[1:]
+    backup = select_backup(backups)
+    extra_backups = [path for path in backups if path != backup]
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     current_tmp = app.with_name(f"Claude.restore-current-{stamp}.app")
 
     if dry_run:
         if app.exists():
             print(f"[dry-run] Would move current app {app} -> {current_tmp}")
-        print(f"[dry-run] Would restore oldest backup {backup} -> {app}")
+        print(f"[dry-run] Would restore backup {backup} -> {app}")
         for extra_backup in extra_backups:
             print(f"[dry-run] Would delete extra backup: {extra_backup}")
         return backup
@@ -1425,7 +1795,7 @@ def restore_oldest_backup(app: Path, dry_run: bool) -> Path:
         shutil.move(str(app), str(current_tmp))
 
     try:
-        print(f"Restoring oldest backup: {backup}")
+        print(f"Restoring backup: {backup}")
         shutil.move(str(backup), str(app))
     except Exception:
         if current_tmp.exists() and not app.exists():
@@ -1441,13 +1811,71 @@ def restore_oldest_backup(app: Path, dry_run: bool) -> Path:
     return backup
 
 
+def verify_electron_asar_integrity(app: Path) -> None:
+    info_plist = app / "Contents/Info.plist"
+    with info_plist.open("rb") as f:
+        info = plistlib.load(f)
+    integrity = info.get("ElectronAsarIntegrity", {})
+    if not isinstance(integrity, dict):
+        raise SystemExit("Unsupported ElectronAsarIntegrity shape in Info.plist.")
+
+    targets = [("Resources/app.asar", app / APP_ASAR_REL)]
+    frontend_asar = app / FRONTEND_ASAR_REL
+    if frontend_asar.is_file():
+        targets.append(("Resources/ion-dist.asar", frontend_asar))
+
+    for key, asar_path in targets:
+        entry = integrity.get(key)
+        # app.asar 必须由官方声明；ion-dist.asar 仅在应用声明了完整性时才校验。
+        if not isinstance(entry, dict):
+            if key == "Resources/app.asar":
+                raise SystemExit(f"Electron {key} integrity entry is missing from Info.plist.")
+            continue
+        data = asar_path.read_bytes()
+        _header_size, header_string, _header = read_asar_header(data, asar_path)
+        expected = asar_header_hash(header_string)
+        actual = entry.get("hash")
+        if actual != expected:
+            raise SystemExit(
+                f"Electron {key} integrity mismatch: "
+                f"Info.plist has {actual!r}, expected {expected}."
+            )
+        print(f"Verified Electron {key} integrity")
+    verify_integrity_digest_slot(app, integrity)
+
+
+
+
+def read_frontend_entry(app: Path, relative: str) -> bytes | None:
+    """Read one frontend file whether it lives in ion-dist/ or ion-dist.asar."""
+    asar = app / FRONTEND_ASAR_REL
+    if asar.is_file():
+        data = asar.read_bytes()
+        header_size, _header_string, header = read_asar_header(data, asar)
+        return read_asar_entry(data, header_size, header, relative)
+    path = app / FRONTEND_DIR_REL / relative
+    return path.read_bytes() if path.is_file() else None
+
+
 def verify(app: Path, lang_code: str) -> None:
     start = time.perf_counter()
-    frontend = app / FRONTEND_I18N_REL / f"{lang_code}.json"
-    data = load_json(frontend)
+    raw = read_frontend_entry(app, f"i18n/{lang_code}.json")
+    if raw is None:
+        raise SystemExit(f"Missing frontend i18n catalog: i18n/{lang_code}.json")
+    data = json.loads(raw.decode("utf-8"))
     values = [v for v in data.values() if isinstance(v, str)]
     chinese = sum(1 for v in values if re.search(r"[\u4e00-\u9fff]", v))
     print(f"Verified frontend {lang_code} JSON: {chinese}/{len(values)} strings contain Chinese")
+
+    if read_frontend_entry(app, "i18n/dynamic/en-US.json") is not None:
+        if read_frontend_entry(app, f"i18n/dynamic/{lang_code}.json") is None:
+            raise SystemExit(
+                f"Missing required dynamic i18n catalog: i18n/dynamic/{lang_code}.json; "
+                "Claude >= 2.9939.2 fails to load the language without it."
+            )
+        print(f"Verified frontend dynamic {lang_code} catalog exists")
+
+    verify_electron_asar_integrity(app)
 
     verify_result = run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app)], check=False)
     if verify_result.returncode == 0:
@@ -1455,12 +1883,13 @@ def verify(app: Path, lang_code: str) -> None:
     else:
         print("App signature verification failed:")
         print(verify_result.stdout, end="")
+        raise SystemExit("Refusing to install an app with an invalid signature.")
 
     entitlements = read_entitlements(app)
     if "com.apple.security.virtualization" in entitlements:
         print("Verified virtualization entitlement")
     else:
-        print("Warning: virtualization entitlement is missing")
+        raise SystemExit("Virtualization entitlement is missing after re-signing.")
 
     result = run(["codesign", "-dv", str(app)], check=False).stdout
     for line in result.splitlines():
@@ -1476,19 +1905,59 @@ def main() -> int:
     parser.add_argument("--lang", choices=["zh-CN", "zh-TW", "zh-HK"], default="zh-CN", help="Language code to install (default: zh-CN)")
     parser.add_argument("--dry-run", action="store_true", help="Prepare and verify a patched temp app, but do not replace /Applications/Claude.app")
     parser.add_argument("--launch", action="store_true", help="Launch Claude after installation")
-    parser.add_argument("--restore", action="store_true", help="Restore the oldest macOS app backup and delete other backups")
-    parser.add_argument("--skip-asar-patch", action="store_true", help="Skip app.asar and binary integrity patches (safe mode)")
+    parser.add_argument("--restore", action="store_true", help="Restore the latest macOS app backup and delete other backups")
+    parser.add_argument(
+        "--restore-if-backup-exists",
+        action="store_true",
+        help="Before install, restore the latest app backup when the installed app is patched; skip when it is an official build",
+    )
+    parser.add_argument(
+        "--skip-asar-patch",
+        action="store_true",
+        help="Deprecated and ignored: this localization no longer modifies app.asar",
+    )
     parser.add_argument(
         "--set-auto-updates",
         choices=["enabled", "disabled"],
-        help="Only update Claude-3p auto-update setting, then exit",
+        help="Only update Claude Desktop auto-update setting, then exit",
+    )
+    parser.add_argument(
+        "--sync-cc-switch-skills",
+        action="store_true",
+        help="Link missing CC Switch skills into Claude Desktop and update the skills manifest, then exit",
+    )
+    parser.add_argument(
+        "--unsync-cc-switch-skills",
+        action="store_true",
+        help="Remove CC Switch skill symlinks from Claude Desktop and update the skills manifest, then exit",
+    )
+    parser.add_argument(
+        "--cc-switch-skills-dir",
+        type=Path,
+        help="CC Switch skills directory (default: USER_HOME/.cc-switch/skills)",
     )
     args = parser.parse_args()
 
     if args.set_auto_updates:
-        set_third_party_auto_updates(
+        set_auto_updates(
             args.user_home,
             enabled=args.set_auto_updates == "enabled",
+            dry_run=args.dry_run,
+        )
+        return 0
+
+    if args.sync_cc_switch_skills:
+        sync_cc_switch_skills(
+            args.user_home,
+            args.cc_switch_skills_dir or args.user_home / ".cc-switch/skills",
+            dry_run=args.dry_run,
+        )
+        return 0
+
+    if args.unsync_cc_switch_skills:
+        unsync_cc_switch_skills(
+            args.user_home,
+            args.cc_switch_skills_dir or args.user_home / ".cc-switch/skills",
             dry_run=args.dry_run,
         )
         return 0
@@ -1505,7 +1974,7 @@ def main() -> int:
             print("[dry-run] Claude will not be quit.")
         else:
             quit_claude()
-        restored = restore_oldest_backup(args.app, args.dry_run)
+        restored = restore_backup(args.app, args.dry_run)
         if args.dry_run:
             print(f"[dry-run] Would set Claude config locale under: {args.user_home} to en-US")
         else:
@@ -1513,7 +1982,30 @@ def main() -> int:
             print(f"Restored from backup: {restored}")
             if args.launch:
                 run(["open", "-a", str(args.app)], check=False)
-        print("Done. Claude Desktop has been restored to the oldest backup.")
+        print("Done. Claude Desktop has been restored from the latest backup.")
+        return 0
+
+    if args.restore_if_backup_exists:
+        if not find_app_backups(args.app):
+            print(f"No Claude backup found in {args.app.parent}: {BACKUP_GLOB}; skipping pre-install restore.")
+            return 0
+        if not preinstall_should_restore(args.app):
+            # Auto-update replaces the patched app with an official build, so a
+            # lingering backup is stale here. Restoring it would downgrade Claude
+            # and delete the fresh version (issue #156); patch this app directly.
+            print(
+                f"Officially signed app detected: {args.app} "
+                f"(version {bundle_version(args.app)}); skipping pre-install restore."
+            )
+            return 0
+        if args.dry_run:
+            print("[dry-run] Claude will not be quit.")
+        else:
+            quit_claude()
+        restored = restore_backup(args.app, args.dry_run)
+        if not args.dry_run:
+            print(f"Restored from backup before install: {restored}")
+        print("Done. Existing Chinese patch has been cleared before install.")
         return 0
 
     lang_code = args.lang
@@ -1536,26 +2028,19 @@ def main() -> int:
     patched_app = tmp_root / "Claude.app"
 
     copy_app(args.app, patched_app)
-    patch_language_whitelist(patched_app, lang_code)
-    patch_hardcoded_frontend_strings(patched_app, lang_code)
-    patch_language_display_names(patched_app)
-    if args.skip_asar_patch:
-        print("Skipping online claude.ai locale preload patch (--skip-asar-patch)")
-    else:
-        patch_online_locale_preload(patched_app, lang_code)
-        patch_online_locale_main_process(patched_app, lang_code)
-    if args.skip_asar_patch:
-        print("Applying length-preserving main-process menu label patch (--skip-asar-patch)")
-        patch_length_preserving_main_process_menu_labels(patched_app, lang_code)
-    else:
-        patch_hardcoded_main_process_menu_labels(patched_app, lang_code)
-    if args.skip_asar_patch:
-        print("Skipping 3P model validation patch (--skip-asar-patch)")
-    else:
-        patch_custom3p_model_validation(patched_app)
-    merge_frontend_locale(patched_app, lang_code)
-    install_desktop_locale(patched_app, lang_code)
-    install_statsig_locale(patched_app, lang_code)
+    frontend_target = prepare_frontend_target(patched_app)
+    try:
+        patch_language_whitelist(patched_app, lang_code)
+        patch_hardcoded_frontend_strings(patched_app, lang_code)
+        patch_slash_command_menu(patched_app, lang_code)
+        patch_language_display_names(patched_app)
+        merge_frontend_locale(patched_app, lang_code)
+        install_desktop_locale(patched_app, lang_code)
+        install_statsig_locale(patched_app, lang_code)
+        install_dynamic_locale(patched_app, lang_code)
+        finalize_frontend_target(patched_app, frontend_target)
+    finally:
+        cleanup_frontend_target(frontend_target)
     resign_app(patched_app)
     clear_quarantine(patched_app)
     if args.dry_run:
@@ -1567,6 +2052,7 @@ def main() -> int:
     backup = backup_and_replace(args.app, patched_app, args.dry_run)
     if not args.dry_run:
         print(f"Backup kept at: {backup}")
+        prune_stale_backups(args.app, keep=backup, dry_run=False)
         if args.launch:
             run(["open", "-a", str(args.app)], check=False)
 
