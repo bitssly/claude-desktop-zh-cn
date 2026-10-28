@@ -2249,12 +2249,42 @@ function Set-ClaudeManagedAutoUpdates {
     }
 }
 
+function Get-StorePolicyRegistryPath {
+    return "HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore"
+}
+
+function Set-StoreAutoUpdatePolicy {
+    param([bool]$Enabled)
+
+    # MSIX（商店版）的更新由 Microsoft Store 下发，Claude 自身的
+    # disableAutoUpdates 策略管不到它；商店每次自动更新都会整体替换
+    # WindowsApps 下的 Claude_* 包目录，把已打的补丁全部冲掉。
+    # 这里同步启停商店的"关闭自动下载更新"策略（AutoDownload=2）。
+    $policyPath = Get-StorePolicyRegistryPath
+    try {
+        if ($Enabled) {
+            if (Test-Path $policyPath) {
+                Remove-ItemProperty -Path $policyPath -Name "AutoDownload" -ErrorAction SilentlyContinue
+            }
+            Write-Host "  已移除 Microsoft Store 自动更新禁用策略: $policyPath" -ForegroundColor DarkGray
+        } else {
+            New-Item -Path $policyPath -Force | Out-Null
+            New-ItemProperty -Path $policyPath -Name "AutoDownload" -Value 2 -PropertyType DWord -Force | Out-Null
+            Write-Host "  已写入 Microsoft Store 自动更新禁用策略: $policyPath (AutoDownload=2)" -ForegroundColor DarkGray
+        }
+    }
+    catch {
+        Write-Host "  [警告] 无法修改 Microsoft Store 更新策略: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
 function Set-ClaudeAutoUpdates {
     param([bool]$Enabled)
 
     if (-not (Set-ThirdPartyConfigAutoUpdates $Enabled)) {
         Set-ClaudeManagedAutoUpdates $Enabled
     }
+    Set-StoreAutoUpdatePolicy $Enabled
 
     if ($Enabled) {
         Write-Host "允许更新成功" -ForegroundColor Green
@@ -3128,6 +3158,9 @@ function Install-WindowsLanguagePack {
         }
         else {
             Write-Host "提示：本补丁不改动 app.asar / Claude.exe，官方账号登录界面请直接使用 Claude 自带的语言设置。" -ForegroundColor DarkGray
+        }
+        if ($installKind -eq "AppX") {
+            Write-Host "注意：商店版（MSIX）的 Claude 更新（商店或应用内）会整体替换安装目录并移除补丁；更新后需重新执行本补丁。" -ForegroundColor DarkYellow
         }
     }
     catch {
